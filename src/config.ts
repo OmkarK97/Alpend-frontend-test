@@ -27,7 +27,7 @@ export const TEMPLATES = {
 
 // Admin backend URL (runs as pool operator for admin-only choices)
 export const ADMIN_API_URL =
-  import.meta.env.VITE_ADMIN_API_URL || 'http://localhost:3100';
+  import.meta.env.VITE_ADMIN_API_URL || (import.meta.env.PROD ? '' : 'http://localhost:3100');
 
 // Canton Coin (CC / Amulet) config
 export const CC_PACKAGE_ID =

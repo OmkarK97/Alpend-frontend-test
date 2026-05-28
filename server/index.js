@@ -2112,6 +2112,12 @@ app.get('/health', (_, res) => {
   });
 });
 
+// Serve frontend static files
+app.use(express.static(join(__dirname, '../dist')));
+app.get('*', (req, res) => {
+  res.sendFile(join(__dirname, '../dist/index.html'));
+});
+
 app.listen(PORT, () => {
   console.log(`Admin server running on port ${PORT}`);
   console.log(`Pool Operator: ${POOL_OPERATOR}`);
