@@ -45,13 +45,21 @@ export interface UsdcxHolding {
   owner: string;
 }
 
+export interface CcHolding {
+  contractId: string;
+  amount: string;
+  owner: string;
+}
+
 export interface PositionData {
   poolCid: string;
   assetReserveCid: string;
+  ccAssetReserveCid: string;
   userPositionCid: string;
   depositPositions: DepositPosition[];
   borrowPositions: BorrowPosition[];
   usdcxHoldings: UsdcxHolding[];
+  ccHoldings: CcHolding[];
 
   totalSupplied: string;
   totalBorrowed: string;
@@ -60,6 +68,13 @@ export interface PositionData {
   totalLiqThresholdCollateralUSD: string;
   healthFactor: string | null;
   walletBalance: string;
+  ccWalletBalance: string;
+
+  // Per-asset breakdowns
+  usdcxSupplied: string;
+  usdcxBorrowed: string;
+  ccSupplied: string;
+  ccBorrowed: string;
 
   loading: boolean;
   error: string | null;

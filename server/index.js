@@ -84,9 +84,11 @@ const CANTON_PROXY_URL = process.env.CANTON_PROXY_URL || 'http://34.72.196.18:40
 
 /** Fetch CC transfer context from Scan registry transfer-factory endpoint.
  *  Returns factoryId, choiceContext (with amulet-rules, open-round, external-party-config-state),
- *  and all disclosed contracts (including ExternalPartyConfigState). */
-async function fetchCCTransferFactory() {
+ *  and all disclosed contracts (including ExternalPartyConfigState).
+ *  @param {string} [sender] - sender party (defaults to pool operator) */
+async function fetchCCTransferFactory(sender) {
   const poolOperator = process.env.POOL_OPERATOR_PARTY;
+  const effectiveSender = sender || poolOperator;
   const dso = `DSO::${(process.env.SYNCHRONIZER_ID || '').split('::')[1] || '1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337'}`;
 
   const resp = await fetch(`${CANTON_PROXY_URL}/api/transfer-factory`, {
@@ -97,7 +99,7 @@ async function fetchCCTransferFactory() {
       choiceArguments: {
         expectedAdmin: dso,
         transfer: {
-          sender: poolOperator,
+          sender: effectiveSender,
           receiver: poolOperator,
           amount: '1.0',
           instrumentId: { admin: dso, id: 'Amulet' },
@@ -124,6 +126,41 @@ async function fetchCCTransferFactory() {
     'context keys:', Object.keys(data.choiceContext?.choiceContextData?.values || {}),
     'disclosed:', data.choiceContext?.disclosedContracts?.length);
   return data;
+}
+
+/** Build CC choice context from env vars (for server-side CC operations).
+ *  Returns choiceContext + CIDs/blobs for building disclosed contracts. */
+async function buildCCChoiceContext() {
+  const amuletRulesCid = process.env.AMULET_RULES_CID;
+  const amuletRulesBlob = process.env.AMULET_RULES_BLOB;
+  const openRoundCid = process.env.OPEN_ROUND_CID;
+  const openRoundBlob = process.env.OPEN_ROUND_BLOB;
+
+  if (!amuletRulesCid || !openRoundCid) {
+    // Fallback: try fetching from Scan proxy
+    try {
+      const data = await fetchCCTransferFactory();
+      const ctx = data.choiceContext?.choiceContextData || { values: {} };
+      return {
+        choiceContext: ctx,
+        openRoundCid: ctx.values?.['open-round']?.value || '',
+        openRoundBlob: '',
+        amuletRulesCid: ctx.values?.['amulet-rules']?.value || '',
+        amuletRulesBlob: '',
+      };
+    } catch (e) {
+      throw new Error(`Missing AMULET_RULES_CID/OPEN_ROUND_CID env vars and Scan proxy fallback failed: ${e.message}`);
+    }
+  }
+
+  const choiceContext = {
+    values: {
+      'amulet-rules': { tag: 'AV_ContractId', value: amuletRulesCid },
+      'open-round': { tag: 'AV_ContractId', value: openRoundCid },
+    },
+  };
+
+  return { choiceContext, openRoundCid, openRoundBlob, amuletRulesCid, amuletRulesBlob };
 }
 
 function buildCCDisclosedContracts(transferFactoryCid, openRoundCid, openRoundBlob, amuletRulesCid, amuletRulesBlob) {
@@ -612,10 +649,12 @@ app.post('/admin/add-observer', async (req, res) => {
 });
 
 /** GET /admin/cc-transfer-context — full CC transfer context (factory CID, choice context, disclosed contracts)
- *  Fetches everything from Scan registry transfer-factory endpoint in one call */
+ *  Fetches everything from Scan registry transfer-factory endpoint.
+ *  Query param: party — the sender's party ID (needed for transfer-preapproval lookup) */
 app.get('/admin/cc-transfer-context', async (req, res) => {
   try {
-    const data = await fetchCCTransferFactory();
+    const party = req.query.party;
+    const data = await fetchCCTransferFactory(party);
 
     // Map response to frontend format
     const transferFactoryCid = data.factoryId;
@@ -631,6 +670,7 @@ app.get('/admin/cc-transfer-context', async (req, res) => {
       transferFactoryCid: transferFactoryCid?.substring(0, 40),
       contextKeys: Object.keys(choiceContext.values || {}),
       disclosedCount: disclosedContracts.length,
+      party: party?.substring(0, 30),
     });
 
     res.json({

@@ -6,6 +6,7 @@ import type {
   DepositPosition,
   BorrowPosition,
   UsdcxHolding,
+  CcHolding,
 } from '../types';
 
 export function usePosition(
@@ -20,11 +21,18 @@ export function usePosition(
   );
   const [borrowPositions, setBorrowPositions] = useState<BorrowPosition[]>([]);
   const [usdcxHoldings, setUsdcxHoldings] = useState<UsdcxHolding[]>([]);
+  const [ccHoldings, setCcHoldings] = useState<CcHolding[]>([]);
+  const [ccAssetReserveCid, setCcAssetReserveCid] = useState('');
+  const [ccWalletBalance, setCcWalletBalance] = useState('0.00');
   const [totalSupplied, setTotalSupplied] = useState('0.00');
   const [totalBorrowed, setTotalBorrowed] = useState('0.00');
   const [totalCollateral, setTotalCollateral] = useState('0.00');
   const [totalWeightedCollateralUSD, setTotalWeightedCollateralUSD] = useState('0.00');
   const [totalLiqThresholdCollateralUSD, setTotalLiqThresholdCollateralUSD] = useState('0.00');
+  const [usdcxSupplied, setUsdcxSupplied] = useState('0.00');
+  const [usdcxBorrowed, setUsdcxBorrowed] = useState('0.00');
+  const [ccSupplied, setCcSupplied] = useState('0.00');
+  const [ccBorrowed, setCcBorrowed] = useState('0.00');
   const [healthFactor, setHealthFactor] = useState<string | null>(null);
   const [walletBalance, setWalletBalance] = useState('0.00');
   const [loading, setLoading] = useState(false);
@@ -35,11 +43,20 @@ export function usePosition(
   const fetchHoldings = useCallback(async () => {
     if (!provider) return;
 
+    // Parsed holding with metadata for splitting into USDCx vs CC
+    type ParsedHolding = {
+      contractId: string;
+      amount: string;
+      owner: string;
+      instrumentId: string;
+      templateId: string;
+      packageName: string;
+    };
+
     // Helper to parse active contract entries from Loop SDK responses
-    const parseHoldings = (result: unknown[]): UsdcxHolding[] => {
+    const parseAllHoldings = (result: unknown[]): ParsedHolding[] => {
       return result
         .map((item: unknown) => {
-          // Loop SDK can return flat objects or nested contractEntry objects
           const flat = item as {
             contract_id?: string;
             template_id?: string;
@@ -72,10 +89,8 @@ export function usePosition(
           };
           const ce = nested?.contractEntry?.JsActiveContract?.createdEvent;
 
-          // Get contractId from either format
           const contractId = flat.contract_id || ce?.contractId || '';
 
-          // Get amount
           let amount = '0';
           if (ce) {
             const rawAmt = ce.createArgument?.amount;
@@ -92,7 +107,6 @@ export function usePosition(
                 : rawAmt?.toString() || '0';
           }
 
-          // Get instrument ID for filtering
           const instrumentId =
             flat.instrument_id?.id ||
             flat.payload?.instrumentId?.id ||
@@ -104,18 +118,38 @@ export function usePosition(
 
           return { contractId, amount, instrumentId, templateId, packageName, owner: ce?.createArgument?.owner || flat.payload?.owner || partyId };
         })
+        .filter((h) => !!h.contractId);
+    };
+
+    const setHoldingsFromParsed = (allHoldings: ParsedHolding[]) => {
+      // USDCx: exclude Amulet, keep USDCx or unknown instrument
+      const usdcx = allHoldings
         .filter((h) => {
-          if (!h.contractId) return false;
           if (h.packageName === 'splice-amulet') return false;
           if (h.templateId?.includes('Splice.Amulet')) return false;
           if (h.instrumentId && h.instrumentId !== 'USDCx') return false;
           return true;
         })
-        .map((h) => ({
-          contractId: h.contractId,
-          amount: h.amount,
-          owner: h.owner,
-        }));
+        .map((h) => ({ contractId: h.contractId, amount: h.amount, owner: h.owner }));
+
+      // CC: Amulet holdings
+      const cc = allHoldings
+        .filter((h) =>
+          h.packageName === 'splice-amulet' ||
+          h.templateId?.includes('Splice.Amulet') ||
+          h.instrumentId === 'Amulet'
+        )
+        .map((h) => ({ contractId: h.contractId, amount: h.amount, owner: h.owner }));
+
+      if (usdcx.length > 0) {
+        setUsdcxHoldings(usdcx);
+        setWalletBalance(usdcx.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
+      }
+      if (cc.length > 0) {
+        setCcHoldings(cc);
+        setCcWalletBalance(cc.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
+      }
+      console.log('Holdings split: USDCx:', usdcx.length, 'CC:', cc.length);
     };
 
     // Strategy 1: Try getActiveContracts with interface ID (# prefix format from SDK docs)
@@ -126,11 +160,10 @@ export function usePosition(
     for (const iid of interfaceIds) {
       try {
         const loopResult = await provider.getActiveContracts({ interfaceId: iid });
-        const holdings = parseHoldings(loopResult as unknown[]);
-        if (holdings.length > 0) {
-          console.log('Strategy 1: got', holdings.length, 'holdings via interfaceId', iid);
-          setUsdcxHoldings(holdings);
-          setWalletBalance(holdings.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
+        const allHoldings = parseAllHoldings(loopResult as unknown[]);
+        if (allHoldings.length > 0) {
+          console.log('Strategy 1: got', allHoldings.length, 'total holdings via interfaceId', iid);
+          setHoldingsFromParsed(allHoldings);
           return;
         }
       } catch {
@@ -146,11 +179,10 @@ export function usePosition(
     for (const tid of templateIds) {
       try {
         const loopResult = await provider.getActiveContracts({ templateId: tid });
-        const holdings = parseHoldings(loopResult as unknown[]);
-        if (holdings.length > 0) {
-          console.log('Strategy 2: got', holdings.length, 'holdings via templateId', tid);
-          setUsdcxHoldings(holdings);
-          setWalletBalance(holdings.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
+        const allHoldings = parseAllHoldings(loopResult as unknown[]);
+        if (allHoldings.length > 0) {
+          console.log('Strategy 2: got', allHoldings.length, 'total holdings via templateId', tid);
+          setHoldingsFromParsed(allHoldings);
           return;
         }
       } catch {
@@ -243,7 +275,7 @@ export function usePosition(
     if (!initialLoadDone.current) setLoading(true);
     setError(null);
 
-    // Fetch holdings from Loop SDK independently (doesn't need backend)
+    // Fetch all holdings from Loop SDK (returns both USDCx and CC)
     const holdingsPromise = fetchHoldings();
 
     // Fetch position data from backend
@@ -285,6 +317,19 @@ export function usePosition(
           ? usdcxReserves[usdcxReserves.length - 1]
           : null;
       if (latestReserve) setAssetReserveCid(latestReserve.contractId);
+
+      // Asset reserve (CC / Amulet)
+      const ccReserves =
+        reserveResp.contracts?.filter(
+          (c: { createArgument?: { instrumentAdmin?: string; instrumentId?: { id?: string } } }) =>
+            c.createArgument?.instrumentAdmin?.startsWith('DSO::') ||
+            c.createArgument?.instrumentId?.id === 'Amulet'
+        ) || [];
+      const latestCcReserve =
+        ccReserves.length > 0
+          ? ccReserves[ccReserves.length - 1]
+          : null;
+      if (latestCcReserve) setCcAssetReserveCid(latestCcReserve.contractId);
 
       // User position
       const userPosFiltered =
@@ -387,24 +432,24 @@ export function usePosition(
 
       // Compute totals from deposit/borrow positions directly
       // This is more reliable than the UserPosition aggregates which may lag
-      const depositsTotal = deposits.reduce(
-        (sum, d) => sum + parseFloat(d.principal),
-        0
-      );
+      const isCC = (d: { instrumentId: { admin: string; id: string } }) =>
+        d.instrumentId.id === 'Amulet' || d.instrumentId.admin?.startsWith('DSO::');
+
+      const usdcxDeps = deposits.filter((d) => !isCC(d));
+      const ccDeps = deposits.filter((d) => isCC(d));
+      const usdcxBors = borrows.filter((b) => !isCC(b));
+      const ccBors = borrows.filter((b) => isCC(b));
+
+      setUsdcxSupplied(usdcxDeps.reduce((s, d) => s + parseFloat(d.principal), 0).toFixed(10));
+      setCcSupplied(ccDeps.reduce((s, d) => s + parseFloat(d.principal), 0).toFixed(10));
+      setUsdcxBorrowed(usdcxBors.reduce((s, b) => s + parseFloat(b.principal), 0).toFixed(10));
+      setCcBorrowed(ccBors.reduce((s, b) => s + parseFloat(b.principal), 0).toFixed(10));
+
+      // Override borrow total with filtered positions to handle dust values
       const borrowsTotal = borrows.reduce(
         (sum, b) => sum + parseFloat(b.principal),
         0
       );
-      if (depositsTotal > 0) {
-        setTotalSupplied(depositsTotal.toFixed(10));
-        setTotalCollateral(
-          deposits
-            .filter((d) => d.isUsedAsCollateral)
-            .reduce((sum, d) => sum + parseFloat(d.principal), 0)
-            .toFixed(10)
-        );
-      }
-      // Always set borrow total from filtered positions (overrides UserPosition dust values)
       setTotalBorrowed(borrowsTotal > 0 ? borrowsTotal.toFixed(10) : '0.00');
     } catch (err) {
       setError(
@@ -435,10 +480,12 @@ export function usePosition(
   return {
     poolCid,
     assetReserveCid,
+    ccAssetReserveCid,
     userPositionCid,
     depositPositions,
     borrowPositions,
     usdcxHoldings,
+    ccHoldings,
     totalSupplied,
     totalBorrowed,
     totalCollateral,
@@ -446,6 +493,11 @@ export function usePosition(
     totalLiqThresholdCollateralUSD,
     healthFactor,
     walletBalance,
+    ccWalletBalance,
+    usdcxSupplied,
+    usdcxBorrowed,
+    ccSupplied,
+    ccBorrowed,
     loading,
     error,
     hasUserPosition,

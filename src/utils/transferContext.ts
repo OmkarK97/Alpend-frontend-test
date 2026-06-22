@@ -54,6 +54,36 @@ export async function fetchTransferContext(
   };
 }
 
+export async function fetchCCTransferContext(
+  partyId: string
+): Promise<TransferContext> {
+  const [ccResp, poolDisclosedResp] = await Promise.all([
+    fetch(`${ADMIN_API_URL}/admin/cc-transfer-context?party=${encodeURIComponent(partyId)}`),
+    fetch(
+      `${ADMIN_API_URL}/admin/pool-disclosed-contracts?party=${encodeURIComponent(partyId)}`
+    ),
+  ]);
+
+  const [ccData, poolDisclosedData] = await Promise.all([
+    ccResp.json(),
+    poolDisclosedResp.json(),
+  ]);
+
+  if (!ccData.success) {
+    throw new Error(ccData.error || 'Failed to fetch CC transfer context');
+  }
+
+  const ccDisclosed: DisclosedContract[] = ccData.disclosedContracts || [];
+  const poolDisclosed: DisclosedContract[] =
+    poolDisclosedData.disclosedContracts || [];
+
+  return {
+    transferFactoryCid: ccData.transferFactoryCid,
+    choiceContext: ccData.choiceContext || { values: {} },
+    disclosedContracts: [...ccDisclosed, ...poolDisclosed],
+  };
+}
+
 export async function fetchPoolDisclosedContracts(
   partyId: string
 ): Promise<DisclosedContract[]> {

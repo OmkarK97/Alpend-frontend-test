@@ -5,11 +5,20 @@ import type { SubmitTxOptions } from '../hooks/useLoop';
 import { buildInitializeUserPositionCommand } from '../commands/pool';
 import { fetchPoolDisclosedContracts } from '../utils/transferContext';
 import { SupplyModal } from './SupplyModal';
+import { CCSupplyModal } from './CCSupplyModal';
 import { BorrowModal } from './BorrowModal';
 import { WithdrawModal } from './WithdrawModal';
 import { RepayModal } from './RepayModal';
+import { OpenVaultModal } from './OpenVaultModal';
 
-type ModalType = 'supply' | 'borrow' | 'withdraw' | 'repay' | null;
+type ModalType =
+  | 'supply'
+  | 'borrow'
+  | 'withdraw'
+  | 'repay'
+  | 'cc-supply'
+  | 'open-vault'
+  | null;
 
 interface Props {
   partyId: string;
@@ -155,6 +164,23 @@ export function Dashboard({
         </div>
       </div>
 
+      {/* One Protocol — Loop-signed Open Vault (CDP) */}
+      <div className="init-banner">
+        <div className="init-banner-content">
+          <h3>One Protocol — Open Vault</h3>
+          <p>
+            Create an <code>ExternalOpenVaultRequest</code> signed directly by
+            your Loop wallet. No transfer flow.
+          </p>
+        </div>
+        <button
+          onClick={() => setActiveModal('open-vault')}
+          className="btn-action btn-borrow"
+        >
+          Open Vault
+        </button>
+      </div>
+
       {/* Initialize Position Banner */}
       {!position.hasUserPosition && position.poolCid && (
         <div className="init-banner">
@@ -212,13 +238,13 @@ export function Dashboard({
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.totalSupplied).toFixed(4)}
+                {parseFloat(position.usdcxSupplied).toFixed(4)}
               </span>
               <span className="cell-label">USDCx</span>
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.totalBorrowed).toFixed(4)}
+                {parseFloat(position.usdcxBorrowed).toFixed(4)}
               </span>
               <span className="cell-label">USDCx</span>
             </div>
@@ -260,6 +286,67 @@ export function Dashboard({
                   position.borrowPositions.length === 0
                 }
                 className="btn-action-sm btn-repay"
+              >
+                Repay
+              </button>
+            </div>
+          </div>
+
+          <div className="asset-row">
+            <div className="asset-name">
+              <div className="asset-icon asset-icon-cc">C</div>
+              <div>
+                <div className="asset-title">CC</div>
+                <div className="asset-subtitle">Canton Coin</div>
+              </div>
+            </div>
+            <div className="asset-cell">
+              <span className="cell-value">
+                {parseFloat(position.ccWalletBalance).toFixed(4)}
+              </span>
+              <span className="cell-label">CC</span>
+            </div>
+            <div className="asset-cell">
+              <span className="cell-value">
+                {parseFloat(position.ccSupplied).toFixed(4)}
+              </span>
+              <span className="cell-label">CC</span>
+            </div>
+            <div className="asset-cell">
+              <span className="cell-value">
+                {parseFloat(position.ccBorrowed).toFixed(4)}
+              </span>
+              <span className="cell-label">CC</span>
+            </div>
+            <div className="asset-actions">
+              <button
+                onClick={() => setActiveModal('cc-supply')}
+                disabled={
+                  !position.hasUserPosition ||
+                  position.ccHoldings.length === 0
+                }
+                className="btn-action-sm btn-supply"
+              >
+                Supply
+              </button>
+              <button
+                disabled
+                className="btn-action-sm btn-withdraw"
+                title="CC withdraw coming soon"
+              >
+                Withdraw
+              </button>
+              <button
+                disabled
+                className="btn-action-sm btn-borrow"
+                title="CC borrow coming soon"
+              >
+                Borrow
+              </button>
+              <button
+                disabled
+                className="btn-action-sm btn-repay"
+                title="CC repay coming soon"
               >
                 Repay
               </button>
@@ -341,6 +428,22 @@ export function Dashboard({
         <RepayModal
           partyId={partyId}
           position={position}
+          submitTx={submitTx}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+      {activeModal === 'cc-supply' && (
+        <CCSupplyModal
+          partyId={partyId}
+          position={position}
+          submitTx={submitTx}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+      {activeModal === 'open-vault' && (
+        <OpenVaultModal
+          partyId={partyId}
+          provider={provider}
           submitTx={submitTx}
           onClose={() => setActiveModal(null)}
         />
