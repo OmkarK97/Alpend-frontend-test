@@ -280,7 +280,7 @@ export function usePosition(
 
     // Fetch position data from backend
     try {
-      const [poolResp, reserveResp, userPosResp, depositResp, borrowResp] =
+      const [poolResp, reserveResp, userPosResp, depositResp, borrowResp, poolStatusResp] =
         await Promise.all([
           fetch(`${ADMIN_API_URL}/query/lending-pool`).then((r) => r.json()).catch(() => ({ contracts: [] })),
           fetch(`${ADMIN_API_URL}/admin/asset-reserves`).then((r) => r.json()).catch(() => ({ contracts: [] })),
@@ -297,6 +297,7 @@ export function usePosition(
           )
             .then((r) => r.json())
             .catch(() => ({ contracts: [] })),
+          fetch(`${ADMIN_API_URL}/admin/pool-status`).then((r) => r.json()).catch(() => ({})),
         ]);
 
       // Pool
@@ -345,23 +346,10 @@ export function usePosition(
       if (latestUserPos) {
         setUserPositionCid(latestUserPos.contractId);
         setHasUserPosition(true);
-        const args = latestUserPos.createArgument || {};
-        setTotalSupplied(args.totalSuppliedUSD || '0.00');
-        setTotalBorrowed(args.totalBorrowedUSD || '0.00');
-        setTotalCollateral(args.totalCollateralUSD || '0.00');
-        setTotalWeightedCollateralUSD(args.totalWeightedCollateralUSD || '0.00');
-        setTotalLiqThresholdCollateralUSD(args.totalLiqThresholdCollateralUSD || '0.00');
-
-        // Health factor — treat dust amounts (< $0.01) as zero
-        const borrowed = parseFloat(args.totalBorrowedUSD || '0');
-        const liqThreshold = parseFloat(
-          args.totalLiqThresholdCollateralUSD || '0'
-        );
-        if (borrowed > 0.01 && liqThreshold > 0) {
-          setHealthFactor((liqThreshold / borrowed).toFixed(2));
-        } else {
-          setHealthFactor(null);
-        }
+        // USD aggregates are computed below from positions × prices × risk params.
+        // The post-audit DAR's UserPosition no longer caches totalCollateralUSD etc.
+        // (HF is recomputed on-chain in-transaction), so reading those fields off the
+        // contract would always be undefined → $0.
       } else {
         setHasUserPosition(false);
       }
@@ -445,12 +433,59 @@ export function usePosition(
       setUsdcxBorrowed(usdcxBors.reduce((s, b) => s + parseFloat(b.principal), 0).toFixed(10));
       setCcBorrowed(ccBors.reduce((s, b) => s + parseFloat(b.principal), 0).toFixed(10));
 
-      // Override borrow total with filtered positions to handle dust values
-      const borrowsTotal = borrows.reduce(
-        (sum, b) => sum + parseFloat(b.principal),
-        0
+      // USD aggregates — the post-audit DAR no longer caches these on UserPosition, so
+      // compute them here from positions × live oracle prices × per-asset risk params.
+      const prices =
+        (poolStatusResp as { oracle?: { prices?: Record<string, { price?: string }> } })
+          ?.oracle?.prices || {};
+      const assetInfo: Record<string, { price: number; ltv: number; liqThreshold: number }> = {};
+      for (const c of (reserveResp.contracts || []) as Array<{
+        createArgument?: {
+          instrumentId?: { id?: string };
+          riskParams?: { priceFeedId?: string; ltv?: string; liquidationThreshold?: string };
+        };
+      }>) {
+        const a = c.createArgument;
+        const id = a?.instrumentId?.id;
+        const feed = a?.riskParams?.priceFeedId || '';
+        if (id) {
+          assetInfo[id] = {
+            price: parseFloat(prices[feed]?.price || '0'),
+            ltv: parseFloat(a?.riskParams?.ltv || '0'),
+            liqThreshold: parseFloat(a?.riskParams?.liquidationThreshold || '0'),
+          };
+        }
+      }
+
+      let suppliedUSD = 0;
+      let collateralUSD = 0;
+      let weightedUSD = 0;
+      let liqThreshUSD = 0;
+      for (const d of deposits) {
+        const info = assetInfo[d.instrumentId.id] || { price: 0, ltv: 0, liqThreshold: 0 };
+        const valueUSD = parseFloat(d.principal) * info.price;
+        suppliedUSD += valueUSD;
+        if (d.isUsedAsCollateral) {
+          collateralUSD += valueUSD;
+          weightedUSD += valueUSD * info.ltv;
+          liqThreshUSD += valueUSD * info.liqThreshold;
+        }
+      }
+      let borrowedUSD = 0;
+      for (const b of borrows) {
+        borrowedUSD += parseFloat(b.principal) * (assetInfo[b.instrumentId.id]?.price || 0);
+      }
+
+      setTotalSupplied(suppliedUSD.toFixed(2));
+      setTotalCollateral(collateralUSD.toFixed(2));
+      setTotalWeightedCollateralUSD(weightedUSD.toFixed(2));
+      setTotalLiqThresholdCollateralUSD(liqThreshUSD.toFixed(2));
+      setTotalBorrowed(borrowedUSD.toFixed(2));
+      setHealthFactor(
+        borrowedUSD > 0.01 && liqThreshUSD > 0
+          ? (liqThreshUSD / borrowedUSD).toFixed(2)
+          : null
       );
-      setTotalBorrowed(borrowsTotal > 0 ? borrowsTotal.toFixed(10) : '0.00');
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Failed to fetch position data'

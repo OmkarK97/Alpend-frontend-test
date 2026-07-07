@@ -4,6 +4,7 @@ import { usePosition } from './hooks/usePosition';
 import { ConnectWallet } from './components/ConnectWallet';
 import { Dashboard } from './components/Dashboard';
 import { AdminPage } from './components/AdminPage';
+import { TransferPage } from './components/TransferPage';
 import { TransactionLog } from './components/TransactionLog';
 
 export default function App() {
@@ -30,6 +31,7 @@ export default function App() {
   }, []);
 
   const isAdmin = route === '#/admin';
+  const isTransfer = route === '#/transfer';
 
   return (
     <div className="app">
@@ -42,9 +44,15 @@ export default function App() {
         <nav className="header-nav">
           <a
             href="#/"
-            className={`header-link ${!isAdmin ? 'header-link-active' : ''}`}
+            className={`header-link ${!isAdmin && !isTransfer ? 'header-link-active' : ''}`}
           >
             Dashboard
+          </a>
+          <a
+            href="#/transfer"
+            className={`header-link ${isTransfer ? 'header-link-active' : ''}`}
+          >
+            Transfer
           </a>
           <a
             href="#/admin"
@@ -65,7 +73,9 @@ export default function App() {
       </header>
 
       <main className="app-main">
-        {!isConnected ? (
+        {isTransfer ? (
+          <TransferPage partyId={partyId} />
+        ) : !isConnected ? (
           <div className="connect-prompt">
             <div className="connect-prompt-card">
               <h2>Welcome to Alpend Lending</h2>

@@ -5,7 +5,6 @@ import type { SubmitTxOptions } from '../hooks/useLoop';
 import { buildInitializeUserPositionCommand } from '../commands/pool';
 import { fetchPoolDisclosedContracts } from '../utils/transferContext';
 import { SupplyModal } from './SupplyModal';
-import { CCSupplyModal } from './CCSupplyModal';
 import { BorrowModal } from './BorrowModal';
 import { WithdrawModal } from './WithdrawModal';
 import { RepayModal } from './RepayModal';
@@ -18,6 +17,9 @@ type ModalType =
   | 'repay'
   | 'cc-supply'
   | 'open-vault'
+  | 'cc-withdraw'
+  | 'cc-borrow'
+  | 'cc-repay'
   | null;
 
 interface Props {
@@ -330,23 +332,30 @@ export function Dashboard({
                 Supply
               </button>
               <button
-                disabled
+                onClick={() => setActiveModal('cc-withdraw')}
+                disabled={
+                  !position.hasUserPosition ||
+                  parseFloat(position.ccSupplied) <= 0
+                }
                 className="btn-action-sm btn-withdraw"
-                title="CC withdraw coming soon"
               >
                 Withdraw
               </button>
               <button
-                disabled
+                onClick={() => setActiveModal('cc-borrow')}
+                disabled={!position.hasUserPosition}
                 className="btn-action-sm btn-borrow"
-                title="CC borrow coming soon"
               >
                 Borrow
               </button>
               <button
-                disabled
+                onClick={() => setActiveModal('cc-repay')}
+                disabled={
+                  !position.hasUserPosition ||
+                  parseFloat(position.ccBorrowed) <= 0 ||
+                  position.ccHoldings.length === 0
+                }
                 className="btn-action-sm btn-repay"
-                title="CC repay coming soon"
               >
                 Repay
               </button>
@@ -402,6 +411,7 @@ export function Dashboard({
       {/* Action Modals */}
       {activeModal === 'supply' && (
         <SupplyModal
+          asset="usdcx"
           partyId={partyId}
           position={position}
           submitTx={submitTx}
@@ -410,6 +420,7 @@ export function Dashboard({
       )}
       {activeModal === 'borrow' && (
         <BorrowModal
+          asset="usdcx"
           partyId={partyId}
           position={position}
           submitTx={submitTx}
@@ -418,6 +429,7 @@ export function Dashboard({
       )}
       {activeModal === 'withdraw' && (
         <WithdrawModal
+          asset="usdcx"
           partyId={partyId}
           position={position}
           submitTx={submitTx}
@@ -426,6 +438,7 @@ export function Dashboard({
       )}
       {activeModal === 'repay' && (
         <RepayModal
+          asset="usdcx"
           partyId={partyId}
           position={position}
           submitTx={submitTx}
@@ -433,7 +446,35 @@ export function Dashboard({
         />
       )}
       {activeModal === 'cc-supply' && (
-        <CCSupplyModal
+        <SupplyModal
+          asset="cc"
+          partyId={partyId}
+          position={position}
+          submitTx={submitTx}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+      {activeModal === 'cc-withdraw' && (
+        <WithdrawModal
+          asset="cc"
+          partyId={partyId}
+          position={position}
+          submitTx={submitTx}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+      {activeModal === 'cc-borrow' && (
+        <BorrowModal
+          asset="cc"
+          partyId={partyId}
+          position={position}
+          submitTx={submitTx}
+          onClose={() => setActiveModal(null)}
+        />
+      )}
+      {activeModal === 'cc-repay' && (
+        <RepayModal
+          asset="cc"
           partyId={partyId}
           position={position}
           submitTx={submitTx}

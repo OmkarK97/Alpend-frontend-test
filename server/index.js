@@ -48,6 +48,19 @@ async function getToken() {
 
 async function submitCommand(commands, actAsParties, disclosedContracts = []) {
   const token = await getToken();
+  // Prefer the CURRENT amulet package version for interpretation. The registry can
+  // disclose amulet contracts spanning multiple versions (e.g. AmuletRules on an older
+  // package, ExternalPartyConfigState on the current one). packageIdSelectionPreference
+  // allows only ONE package-id per package-name, and it must be the NEWEST so older
+  // contracts UPGRADE to it — downgrading a newer contract fails ("optional field ...
+  // may not be dropped"). The ExternalPartyConfigState contract tracks the current amulet
+  // version, so key the preference off its package.
+  const configState = disclosedContracts.find((dc) =>
+    (dc.templateId || '').includes('ExternalPartyConfigState')
+  );
+  const amuletPkg = configState ? (configState.templateId || '').split(':')[0] : null;
+  const extraPrefs = amuletPkg && /^[0-9a-f]{64}$/.test(amuletPkg) ? [amuletPkg] : [];
+  const packageIdSelectionPreference = [...new Set([LENDING_PACKAGE_ID, ...extraPrefs])];
   const payload = {
     commands: {
       commands,
@@ -55,9 +68,10 @@ async function submitCommand(commands, actAsParties, disclosedContracts = []) {
       actAs: Array.isArray(actAsParties) ? actAsParties : [actAsParties],
       readAs: [],
       disclosedContracts,
-      packageIdSelectionPreference: [LENDING_PACKAGE_ID],
+      packageIdSelectionPreference,
     },
   };
+  console.log('packageIdSelectionPreference:', packageIdSelectionPreference);
   console.log('submitCommand payload:', JSON.stringify(payload, null, 2));
   const resp = await fetch(`${LEDGER_URL}/v2/commands/submit-and-wait-for-transaction`, {
     method: 'POST',
@@ -86,7 +100,7 @@ const CANTON_PROXY_URL = process.env.CANTON_PROXY_URL || 'http://34.72.196.18:40
  *  Returns factoryId, choiceContext (with amulet-rules, open-round, external-party-config-state),
  *  and all disclosed contracts (including ExternalPartyConfigState).
  *  @param {string} [sender] - sender party (defaults to pool operator) */
-async function fetchCCTransferFactory(sender) {
+async function fetchCCTransferFactory(sender, overrides = {}) {
   const poolOperator = process.env.POOL_OPERATOR_PARTY;
   const effectiveSender = sender || poolOperator;
   const dso = `DSO::${(process.env.SYNCHRONIZER_ID || '').split('::')[1] || '1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337'}`;
@@ -100,12 +114,12 @@ async function fetchCCTransferFactory(sender) {
         expectedAdmin: dso,
         transfer: {
           sender: effectiveSender,
-          receiver: poolOperator,
-          amount: '1.0',
+          receiver: overrides.receiver || poolOperator,
+          amount: overrides.amount || '1.0',
           instrumentId: { admin: dso, id: 'Amulet' },
           requestedAt: new Date().toISOString(),
           executeBefore: new Date(Date.now() + 86400000).toISOString(),
-          inputHoldingCids: [],
+          inputHoldingCids: overrides.inputHoldingCids || [],
           meta: { values: {} },
         },
         extraArgs: {
@@ -309,10 +323,10 @@ function extractContractId(result) {
 app.get('/admin/pool-status', async (req, res) => {
   try {
     const [oracleContracts, poolContracts, reserveContracts, userPosContracts] = await Promise.all([
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.Oracle:PriceOracle`, POOL_OPERATOR),
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`, POOL_OPERATOR),
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR),
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
     ]);
 
     const latestOracle = oracleContracts[oracleContracts.length - 1];
@@ -349,16 +363,31 @@ app.get('/admin/pool-status', async (req, res) => {
  */
 app.post('/admin/create-oracle', async (req, res) => {
   try {
-    const { maxStalenessSeconds = 3600 } = req.body;
+    const {
+      maxStalenessSeconds = 3600,
+      liquidationMaxStalenessSeconds = 7200,
+      maxDeviationBps = 1000,
+      allowManualPrice = true, // testnet: enables manual SetPrice; deploy false in prod
+    } = req.body;
+    const oraclePusher = process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR;
 
     const commands = [
       {
         CreateCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Oracle:PriceOracle`,
+          templateId: `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`,
           createArguments: {
             poolOperator: POOL_OPERATOR,
+            oraclePusher,
             prices: {},
-            maxStalenessSeconds: parseInt(maxStalenessSeconds),
+            pendingPrices: {},
+            feedAliases: {},
+            // Daml Int must be string-encoded in the JSON Ledger API
+            maxStalenessSeconds: String(parseInt(maxStalenessSeconds)),
+            liquidationMaxStalenessSeconds: String(parseInt(liquidationMaxStalenessSeconds)),
+            maxDeviationBps: String(parseInt(maxDeviationBps)),
+            allowManualPrice,
+            pinnedVerifierCid: null,
+            pinnedVerifierConfigCid: null,
           },
         },
       },
@@ -394,12 +423,13 @@ app.post('/admin/create-pool', async (req, res) => {
     const commands = [
       {
         CreateCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           createArguments: {
             poolOperator: POOL_OPERATOR,
+            oraclePusher: process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR,
+            treasuryParty: process.env.TREASURY_PARTY || POOL_OPERATOR,
             oracleCid,
             assetReserveCids: [],
-            observers: [],
             pauseDeposits: false,
             pauseWithdrawals: false,
             pauseBorrows: false,
@@ -439,7 +469,7 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolContractId,
           choice: 'AddAssetReserve',
           choiceArgument: {
@@ -460,6 +490,8 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
               slope1: interestRateParams.slope1,
               slope2: interestRateParams.slope2,
               reserveFactor: interestRateParams.reserveFactor,
+              // Annualized decay on idle balance (CC holding fee); 0 for non-decaying assets like USDCx
+              holdingFeeRate: interestRateParams.holdingFeeRate ?? '0.0000000000',
             },
           },
         },
@@ -497,16 +529,25 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
  */
 app.post('/admin/set-price', async (req, res) => {
   try {
-    const { oracleCid, feedId, priceValue, featuredAppRightCid = null } = req.body;
+    const { oracleCid: passedCid, feedId, priceValue, featuredAppRightCid = null } = req.body;
 
-    if (!oracleCid || !feedId || !priceValue) {
-      return res.status(400).json({ success: false, error: 'oracleCid, feedId, priceValue are required' });
+    if (!feedId || !priceValue) {
+      return res.status(400).json({ success: false, error: 'feedId and priceValue are required' });
+    }
+
+    // SetPrice is a consuming choice — the oracle CID changes on every call. Resolve the
+    // CURRENT active PriceOracle instead of trusting a possibly-stale CID from the caller
+    // (setting a second price would otherwise hit the archived oracle from the first).
+    const oracles = await queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
+    const oracleCid = oracles.length ? oracles[oracles.length - 1].contractId : passedCid;
+    if (!oracleCid) {
+      return res.status(404).json({ success: false, error: 'No active PriceOracle found' });
     }
 
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Oracle:PriceOracle`,
+          templateId: `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`,
           contractId: oracleCid,
           choice: 'SetPrice',
           choiceArgument: {
@@ -527,12 +568,12 @@ app.post('/admin/set-price', async (req, res) => {
     let updatedPoolCid = null;
     if (newOracleCid) {
       try {
-        const poolContracts = await queryContracts(`${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`, POOL_OPERATOR);
+        const poolContracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR);
         const latestPool = poolContracts[poolContracts.length - 1];
         if (latestPool?.contractId) {
           const updateCmd = [{
             ExerciseCommand: {
-              templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+              templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
               contractId: latestPool.contractId,
               choice: 'UpdateOracleCid',
               choiceArgument: { newOracleCid },
@@ -570,7 +611,7 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
 
     // Auto-detect if not provided
     if (!newOracleCid) {
-      const oracleContracts = await queryContracts(`${LENDING_PACKAGE_ID}:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
+      const oracleContracts = await queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
       const latestOracle = oracleContracts[oracleContracts.length - 1];
       if (!latestOracle?.contractId) {
         return res.status(400).json({ success: false, error: 'No oracle contract found' });
@@ -578,7 +619,7 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
       newOracleCid = latestOracle.contractId;
     }
     if (!poolContractId) {
-      const poolContracts = await queryContracts(`${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`, POOL_OPERATOR);
+      const poolContracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR);
       const latestPool = poolContracts[poolContracts.length - 1];
       if (!latestPool?.contractId) {
         return res.status(400).json({ success: false, error: 'No pool contract found' });
@@ -588,7 +629,7 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
 
     const commands = [{
       ExerciseCommand: {
-        templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+        templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
         contractId: poolContractId,
         choice: 'UpdateOracleCid',
         choiceArgument: { newOracleCid },
@@ -611,7 +652,10 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
   }
 });
 
-/** POST /admin/add-observer */
+/** POST /admin/add-observer — grant a user access to the pool.
+ *  Post-audit the pool's shared observer list was replaced by per-user PoolAccess
+ *  contracts (PV-01): this now exercises GrantPoolAccess, which is *nonconsuming*
+ *  (the pool CID does NOT change) and issues one PoolAccess contract for the user. */
 app.post('/admin/add-observer', async (req, res) => {
   try {
     const { poolContractId, newObserver } = req.body;
@@ -619,31 +663,33 @@ app.post('/admin/add-observer', async (req, res) => {
       return res.status(400).json({ success: false, error: 'poolContractId is required' });
     }
     if (!newObserver) {
-      return res.status(400).json({ success: false, error: 'newObserver is required' });
+      return res.status(400).json({ success: false, error: 'newObserver (user party) is required' });
     }
 
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolContractId,
-          choice: 'AddObserver',
-          choiceArgument: { newObserver },
+          choice: 'GrantPoolAccess',
+          choiceArgument: { user: newObserver },
         },
       },
     ];
 
     const result = await submitCommand(commands, [POOL_OPERATOR]);
-    const newPoolCid = extractContractId(result);
+    // GrantPoolAccess returns the new PoolAccess cid. Do NOT surface it as a pool
+    // CID — the pool is unchanged (nonconsuming), so the caller keeps its poolCid.
+    const poolAccessCid = extractContractId(result);
 
     res.json({
       success: true,
-      newPoolContractId: newPoolCid,
-      message: 'Observer added. Pool CID has changed — use newPoolContractId going forward.',
+      poolAccessCid,
+      message: 'Pool access granted (PoolAccess contract created). Pool CID is unchanged.',
       updateId: result.transaction?.updateId || result.updateId,
     });
   } catch (e) {
-    console.error('ADD OBSERVER error:', e.message);
+    console.error('GRANT POOL ACCESS error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -731,16 +777,17 @@ app.get('/admin/cc-transfer-factory', async (req, res) => {
 app.get('/admin/cc-holdings/:party', async (req, res) => {
   try {
     const { party } = req.params;
-    const ccPackageId = process.env.CC_PACKAGE_ID || '3ca1343ab26b453d38c8adb70dca5f1ead8440c42b59b68f070786955cbf9ec1';
-    const ccTemplate = process.env.CC_TEMPLATE || 'Splice.Amulet:Amulet';
-    const templateId = `${ccPackageId}:${ccTemplate}`;
-    const contracts = await queryContracts(templateId, party);
+    const contracts = await queryCCHoldings(party);
     res.json({
       success: true,
       holdings: contracts.map((c) => ({
         contractId: c.contractId,
-        amount: c.createArgument?.amount?.initialAmount,
-        owner: c.createArgument?.owner,
+        templateId: c.templateId,
+        amount: c.createArgument?.amount?.initialAmount ||
+                c.interfaceViews?.[0]?.viewValue?.amount,
+        owner: c.createArgument?.owner ||
+               c.interfaceViews?.[0]?.viewValue?.owner,
+        createdEventBlob: c.createdEventBlob,
       })),
       rawContracts: contracts,
     });
@@ -753,7 +800,7 @@ app.get('/admin/cc-holdings/:party', async (req, res) => {
 /** GET /admin/asset-reserves — query existing AssetReserve contracts */
 app.get('/admin/asset-reserves', async (req, res) => {
   try {
-    const templateId = `${LENDING_PACKAGE_ID}:Lending.AssetReserve:AssetReserve`;
+    const templateId = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
     const contracts = await queryContracts(templateId, POOL_OPERATOR);
     res.json({ success: true, contracts });
   } catch (e) {
@@ -769,7 +816,7 @@ app.get('/admin/asset-reserves', async (req, res) => {
 /** GET /query/lending-pool — query LendingPool contracts */
 app.get('/query/lending-pool', async (req, res) => {
   try {
-    const templateId = `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`;
+    const templateId = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
     const contracts = await queryContracts(templateId, POOL_OPERATOR);
     res.json({ success: true, contracts });
   } catch (e) {
@@ -781,7 +828,7 @@ app.get('/query/lending-pool', async (req, res) => {
 /** GET /query/user-position/:party — query UserPosition (via pool operator who is observer) */
 app.get('/query/user-position/:party', async (req, res) => {
   try {
-    const templateId = `${LENDING_PACKAGE_ID}:Lending.UserPosition:UserPosition`;
+    const templateId = `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`;
     // Query as pool operator (observer on UserPosition), then filter by party
     const contracts = await queryContracts(templateId, POOL_OPERATOR);
     const filtered = contracts.filter(c => c.createArgument?.user === req.params.party);
@@ -795,7 +842,7 @@ app.get('/query/user-position/:party', async (req, res) => {
 /** GET /query/deposit-position — query all DepositPositions (via pool operator who is observer) */
 app.get('/query/deposit-position/:party?', async (req, res) => {
   try {
-    const templateId = `${LENDING_PACKAGE_ID}:Lending.Deposit:DepositPosition`;
+    const templateId = `#alpend-lending-final-loop:Lending.Deposit:DepositPosition`;
     const contracts = await queryContracts(templateId, POOL_OPERATOR);
     const party = req.params.party;
     const filtered = party ? contracts.filter(c => c.createArgument?.depositor === party) : contracts;
@@ -809,7 +856,7 @@ app.get('/query/deposit-position/:party?', async (req, res) => {
 /** GET /query/borrow-position — query BorrowPositions (via pool operator who is observer) */
 app.get('/query/borrow-position/:party?', async (req, res) => {
   try {
-    const templateId = `${LENDING_PACKAGE_ID}:Lending.Borrow:BorrowPosition`;
+    const templateId = `#alpend-lending-final-loop:Lending.Borrow:BorrowPosition`;
     const contracts = await queryContracts(templateId, POOL_OPERATOR);
     const party = req.params.party;
     const filtered = party ? contracts.filter(c => c.createArgument?.borrower === party) : contracts;
@@ -832,10 +879,10 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
 
     // Fetch all pool-level contracts in parallel
     const [poolContracts, assetReserveContracts, userPosContracts, oracleContracts] = await Promise.all([
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`, POOL_OPERATOR),
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR),
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
-      queryContracts(`${LENDING_PACKAGE_ID}:Lending.Oracle:PriceOracle`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR),
     ]);
 
     const disclosed = [];
@@ -844,7 +891,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
     for (const reserve of assetReserveContracts) {
       if (reserve?.contractId && reserve?.createdEventBlob) {
         disclosed.push({
-          templateId: reserve.templateId || `${LENDING_PACKAGE_ID}:Lending.AssetReserve:AssetReserve`,
+          templateId: reserve.templateId || `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`,
           contractId: reserve.contractId,
           createdEventBlob: reserve.createdEventBlob,
           domainId: synchronizerId,
@@ -856,7 +903,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
     const latestOracle = oracleContracts[oracleContracts.length - 1];
     if (latestOracle?.contractId && latestOracle?.createdEventBlob) {
       disclosed.push({
-        templateId: latestOracle.templateId || `${LENDING_PACKAGE_ID}:Lending.Oracle:PriceOracle`,
+        templateId: latestOracle.templateId || `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`,
         contractId: latestOracle.contractId,
         createdEventBlob: latestOracle.createdEventBlob,
         domainId: synchronizerId,
@@ -869,7 +916,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
       const latestUserPos = userPos[userPos.length - 1] || userPosContracts[userPosContracts.length - 1];
       if (latestUserPos?.contractId && latestUserPos?.createdEventBlob) {
         disclosed.push({
-          templateId: latestUserPos.templateId || `${LENDING_PACKAGE_ID}:Lending.UserPosition:UserPosition`,
+          templateId: latestUserPos.templateId || `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`,
           contractId: latestUserPos.contractId,
           createdEventBlob: latestUserPos.createdEventBlob,
           domainId: synchronizerId,
@@ -881,7 +928,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
     const latestPool = poolContracts[poolContracts.length - 1];
     if (latestPool?.contractId && latestPool?.createdEventBlob) {
       disclosed.push({
-        templateId: latestPool.templateId || `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+        templateId: latestPool.templateId || `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
         contractId: latestPool.contractId,
         createdEventBlob: latestPool.createdEventBlob,
         domainId: synchronizerId,
@@ -918,7 +965,7 @@ app.post('/user/initialize-position', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'InitializeUserPosition',
           choiceArgument: { user },
@@ -973,7 +1020,7 @@ app.post('/user/deposit-cc', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'DepositTSWithPosition',
           choiceArgument: {
@@ -1041,7 +1088,7 @@ app.post('/user/withdraw-cc', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'WithdrawTSWithPosition',
           choiceArgument: {
@@ -1100,7 +1147,7 @@ app.post('/user/borrow-cc', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'BorrowTSWithPosition',
           choiceArgument: {
@@ -1170,7 +1217,7 @@ app.post('/user/repay-cc', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'RepayTSWithPosition',
           choiceArgument: {
@@ -1219,6 +1266,40 @@ app.get('/admin/cc-choice-context', async (req, res) => {
     });
   } catch (e) {
     console.error('CC CHOICE CONTEXT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/cc-payout-context — pool-as-sender CC transfer context (for withdraw/borrow
+ *  payouts), sourced from the REGISTRY. Unlike the hand-rolled cc-choice-context, this returns
+ *  disclosed contracts WITH templateIds and includes external-party-config-state — required for
+ *  an external-party (pool operator) sender. Body: { receiver, amount, holdingCids }. */
+app.post('/admin/cc-payout-context', async (req, res) => {
+  try {
+    const { receiver, amount = '1.0', holdingCids = [] } = req.body;
+    if (!receiver) {
+      return res.status(400).json({ success: false, error: 'receiver is required' });
+    }
+    const factoryData = await fetchCCTransferFactory(POOL_OPERATOR, {
+      receiver,
+      amount: amount.toString(),
+      inputHoldingCids: holdingCids,
+    });
+    const transferFactoryCid = factoryData.factoryId;
+    if (!transferFactoryCid) {
+      return res.json({ success: false, error: 'Registry did not return a CC transfer factory' });
+    }
+    const syncId = process.env.SYNCHRONIZER_ID || 'global-domain::1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337';
+    const choiceContext = factoryData.choiceContext?.choiceContextData || { values: {} };
+    const disclosedContracts = (factoryData.choiceContext?.disclosedContracts || []).map((dc) => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      domainId: dc.synchronizerId || syncId,
+    }));
+    res.json({ success: true, transferFactoryCid, choiceContext, disclosedContracts });
+  } catch (e) {
+    console.error('CC PAYOUT CONTEXT error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -1519,16 +1600,9 @@ app.post('/admin/send-cc', async (req, res) => {
       return res.status(400).json({ success: false, error: 'recipient party is required' });
     }
 
-    const transferFactoryCid = process.env.AMULET_TRANSFER_FACTORY_CID;
-    if (!transferFactoryCid) {
-      return res.status(500).json({ success: false, error: 'AMULET_TRANSFER_FACTORY_CID not configured' });
-    }
-
-    // Fetch pool operator's CC holdings
-    const ccPackageId = process.env.CC_PACKAGE_ID || '3ca1343ab26b453d38c8adb70dca5f1ead8440c42b59b68f070786955cbf9ec1';
-    const ccTemplate = process.env.CC_TEMPLATE || 'Splice.Amulet:Amulet';
-    const templateId = `${ccPackageId}:${ccTemplate}`;
-    const holdings = await queryContracts(templateId, POOL_OPERATOR);
+    // Fetch pool operator's CC holdings (via the Holding interface — the concrete
+    // Amulet template can't be queried by hex package id)
+    const holdings = await queryCCHoldings(POOL_OPERATOR);
 
     if (!holdings.length) {
       return res.json({ success: false, error: 'Pool operator has no CC holdings' });
@@ -1538,13 +1612,35 @@ app.post('/admin/send-cc', async (req, res) => {
     console.log(`Sending ${amount} CC from pool operator to ${recipient}`);
     console.log(`Using ${holdingCids.length} holding(s) as input`);
 
-    // Build CC choice context and disclosed contracts
-    const { choiceContext, openRoundCid, openRoundBlob, amuletRulesCid, amuletRulesBlob } = await buildCCChoiceContext();
-    const disclosedContracts = buildCCDisclosedContracts(transferFactoryCid, openRoundCid, openRoundBlob, amuletRulesCid, amuletRulesBlob);
+    // Get the transfer factory + FULL choice context (incl. external-party-config-state)
+    // + disclosed contracts from the registry, computed for THIS transfer. The env-based
+    // hand-rolled context (buildCCChoiceContext) omits external-party-config-state, which
+    // the TransferFactory_Transfer choice requires for an external-party sender.
+    const factoryData = await fetchCCTransferFactory(POOL_OPERATOR, {
+      receiver: recipient,
+      amount: amount.toString(),
+      inputHoldingCids: holdingCids,
+    });
+    const transferFactoryCid = factoryData.factoryId;
+    if (!transferFactoryCid) {
+      return res.json({ success: false, error: 'Registry did not return a CC transfer factory' });
+    }
+    const choiceContext = factoryData.choiceContext?.choiceContextData || { values: {} };
+    const syncId = process.env.SYNCHRONIZER_ID || 'global-domain::1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337';
+    const disclosedContracts = (factoryData.choiceContext?.disclosedContracts || []).map((dc) => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      synchronizerId: dc.synchronizerId || syncId,
+    }));
 
-    // Use the Holding interface to exercise TransferFactory_Transfer
-    const transferFactoryTemplateId = process.env.AMULET_TRANSFER_FACTORY_TEMPLATE_ID ||
-      '6e9fc50fb94e56751b49f09ba2dc84da53a9d7cff08115ebb4f6b7a12d0c990c:Splice.ExternalPartyAmuletRules:ExternalPartyAmuletRules';
+    // Exercise the token-standard TransferFactory_Transfer (interface choice, referenced
+    // by package NAME so it's version-agnostic). The ExternalPartyAmuletRules contract
+    // implements this interface; the legacy ExternalPartyAmuletRules_Transfer choice was
+    // removed in the current Amulet package.
+    const transferFactoryInterfaceId =
+      '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
+    const dso = `DSO::${(process.env.SYNCHRONIZER_ID || '').split('::')[1] || '1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337'}`;
 
     const currentTime = new Date().toISOString();
     const executeBefore = new Date(Date.now() + 3600000).toISOString();
@@ -1552,26 +1648,20 @@ app.post('/admin/send-cc', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: transferFactoryTemplateId,
+          templateId: transferFactoryInterfaceId,
           contractId: transferFactoryCid,
-          choice: 'ExternalPartyAmuletRules_Transfer',
+          choice: 'TransferFactory_Transfer',
           choiceArgument: {
+            expectedAdmin: dso,
             transfer: {
               sender: POOL_OPERATOR,
               receiver: recipient,
               amount: amount.toString(),
-              instrumentId: {
-                admin: holdings[0].createArgument?.dso || 'DSO::1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337',
-                id: { tag: 'Id', value: 'cc' },
-              },
+              instrumentId: { admin: dso, id: 'Amulet' },
               requestedAt: currentTime,
               executeBefore: executeBefore,
               inputHoldingCids: holdingCids,
-              meta: {
-                values: {
-                  'splice.lfdecentralizedtrust.org/reason': 'CC transfer to create second holding for deposit',
-                },
-              },
+              meta: { values: {} },
             },
             extraArgs: {
               context: choiceContext,
@@ -1662,6 +1752,25 @@ async function queryContractsByInterface(interfaceId, party) {
   return contracts;
 }
 
+// The ledger rejects hex package IDs in template/interface filters ("expected a
+// package name"), so reference the token-standard Holding interface by package NAME
+// (the `#name` form the frontend uses). Both USDCx and Amulet holdings implement it.
+const HOLDING_INTERFACE = '#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding';
+
+/** Fetch a party's CC (Amulet) holdings via the token-standard Holding interface.
+ *  Querying the concrete Amulet template by hex package id is rejected by the ledger
+ *  ("expected a package name"), so we go through the HoldingV1 interface (same path the
+ *  frontend uses) and filter to Amulet. */
+async function queryCCHoldings(party) {
+  const contracts = await queryContractsByInterface(HOLDING_INTERFACE, party);
+  return contracts.filter((c) => {
+    const tmpl = c.templateId || '';
+    const instId = c.createArgument?.instrumentId?.id ||
+                   c.interfaceViews?.[0]?.viewValue?.instrumentId?.id;
+    return tmpl.includes('Splice.Amulet') || instId === 'Amulet';
+  });
+}
+
 /** GET /admin/user-holdings/:party — fetch USDCx holdings for any party using wildcard filter */
 app.get('/admin/user-holdings/:party', async (req, res) => {
   try {
@@ -1683,7 +1792,7 @@ app.get('/admin/user-holdings/:party', async (req, res) => {
               identifierFilter: {
                 InterfaceFilter: {
                   value: {
-                    interfaceId: USDCX_HOLDING_INTERFACE_ID,
+                    interfaceId: HOLDING_INTERFACE,
                     includeCreatedEventBlob: true,
                     includeInterfaceView: true,
                   },
@@ -1759,7 +1868,7 @@ app.get('/admin/user-holdings/:party', async (req, res) => {
 app.get('/admin/usdcx-holdings/:party', async (req, res) => {
   try {
     const { party } = req.params;
-    const contracts = await queryContractsByInterface(USDCX_HOLDING_INTERFACE_ID, party);
+    const contracts = await queryContractsByInterface(HOLDING_INTERFACE, party);
 
     // Filter to only USDCx holdings (by instrument admin)
     const usdcxHoldings = contracts.filter(c => {
@@ -1803,6 +1912,116 @@ app.get('/admin/usdcx-holdings/:party', async (req, res) => {
     });
   } catch (e) {
     console.error('USDCX HOLDINGS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/send-usdcx — Transfer USDCx from the pool operator ("our validator")
+ *  to a recipient party (e.g. a Loop wallet). Server-signed as the operator, using
+ *  the CIP-56 token-standard TransferFactory_Transfer via the USDCx registry. */
+app.post('/admin/send-usdcx', async (req, res) => {
+  try {
+    const { recipient, amount = '1.0' } = req.body;
+    if (!recipient) {
+      return res.status(400).json({ success: false, error: 'recipient party is required' });
+    }
+    if (!USDCX_INSTRUMENT_ADMIN) {
+      return res.status(500).json({ success: false, error: 'USDCX_INSTRUMENT_ADMIN not configured' });
+    }
+
+    // Pool operator's USDCx holdings as transfer inputs
+    const holdingContracts = await queryContractsByInterface(HOLDING_INTERFACE, POOL_OPERATOR);
+    const usdcxHoldings = holdingContracts.filter((c) => {
+      const admin = c.createArgument?.instrumentId?.admin ||
+                    c.interfaceViews?.[0]?.viewValue?.instrumentId?.admin;
+      return !USDCX_INSTRUMENT_ADMIN || admin === USDCX_INSTRUMENT_ADMIN;
+    });
+    if (!usdcxHoldings.length) {
+      return res.json({ success: false, error: 'Pool operator has no USDCx holdings' });
+    }
+    const holdingCids = usdcxHoldings.map((h) => h.contractId);
+
+    const synchronizerId = process.env.SYNCHRONIZER_ID || 'global-domain::1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337';
+    const now = new Date();
+    const executeBefore = new Date(now.getTime() + 10 * 60 * 1000);
+
+    // Get transfer factory + choice context from the USDCx registry
+    const url = `${USDCX_REGISTRY_URL}/api/token-standard/v0/registrars/${USDCX_INSTRUMENT_ADMIN}/registry/transfer-instruction/v1/transfer-factory`;
+    const registryResp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        choiceArguments: {
+          expectedAdmin: USDCX_INSTRUMENT_ADMIN,
+          transfer: {
+            sender: POOL_OPERATOR,
+            receiver: recipient,
+            amount: parseFloat(amount),
+            instrumentId: { admin: USDCX_INSTRUMENT_ADMIN, id: USDCX_INSTRUMENT_ID },
+            requestedAt: now.toISOString(),
+            executeBefore: executeBefore.toISOString(),
+            inputHoldingCids: holdingCids,
+            meta: { values: {} },
+          },
+          extraArgs: { context: { values: {} }, meta: { values: {} } },
+        },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!registryResp.ok) {
+      throw new Error(`USDCx registry API error ${registryResp.status}`);
+    }
+    const data = await registryResp.json();
+    const transferFactoryCid = data.factoryId || data.transferFactoryCid || data.contractId;
+    const contextWrapper = data.choiceContext || data.choiceContextData || {};
+    const choiceContext = contextWrapper.choiceContextData || { values: {} };
+    const rawDisclosed = contextWrapper.disclosedContracts || data.disclosedContracts || [];
+    const disclosedContracts = rawDisclosed.map((dc) => ({
+      templateId: dc.templateId || dc.template_id || '',
+      contractId: dc.contractId || dc.contract_id || '',
+      createdEventBlob: dc.createdEventBlob || dc.created_event_blob || '',
+      domainId: dc.domainId || dc.domain_id || dc.synchronizerId || dc.synchronizer_id || synchronizerId,
+    }));
+
+    const transferFactoryInterfaceId =
+      '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
+
+    const commands = [
+      {
+        ExerciseCommand: {
+          templateId: transferFactoryInterfaceId,
+          contractId: transferFactoryCid,
+          choice: 'TransferFactory_Transfer',
+          choiceArgument: {
+            expectedAdmin: USDCX_INSTRUMENT_ADMIN,
+            transfer: {
+              sender: POOL_OPERATOR,
+              receiver: recipient,
+              amount: amount.toString(),
+              instrumentId: { admin: USDCX_INSTRUMENT_ADMIN, id: USDCX_INSTRUMENT_ID },
+              requestedAt: now.toISOString(),
+              executeBefore: executeBefore.toISOString(),
+              inputHoldingCids: holdingCids,
+              meta: { values: {} },
+            },
+            extraArgs: { context: choiceContext, meta: { values: {} } },
+          },
+        },
+      },
+    ];
+
+    const result = await submitCommand(commands, [POOL_OPERATOR], disclosedContracts);
+    res.json({
+      success: true,
+      message: `Sent ${amount} USDCx to ${recipient}.`,
+      updateId: result.transaction?.updateId,
+      events: result.transaction?.events?.filter((e) => e.CreatedEvent).map((e) => ({
+        contractId: e.CreatedEvent?.contractId,
+        templateId: e.CreatedEvent?.templateId,
+      })),
+    });
+  } catch (e) {
+    console.error('SEND USDCX error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -1855,7 +2074,7 @@ app.post('/admin/create-usdcx-pool', async (req, res) => {
     const commands = [
       {
         CreateCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           createArguments: {
             poolOperator: POOL_OPERATOR,
             instrumentAdmin: USDCX_INSTRUMENT_ADMIN,
@@ -1909,7 +2128,7 @@ app.post('/admin/record-external-deposit', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'RecordExternalDeposit',
           choiceArgument: {
@@ -1964,10 +2183,9 @@ app.post('/admin/seed-cc-liquidity', async (req, res) => {
       return res.status(400).json({ success: false, error: 'assetReserveCid is required' });
     }
 
-    // Find operator's CC holdings
-    const ccPackageId = process.env.CC_PACKAGE_ID || '3ca1343ab26b453d38c8adb70dca5f1ead8440c42b59b68f070786955cbf9ec1';
-    const ccTemplate = `${ccPackageId}:Splice.Amulet:Amulet`;
-    const holdings = await queryContracts(ccTemplate, POOL_OPERATOR);
+    // Find operator's CC holdings (via the Holding interface — the concrete Amulet
+    // template can't be queried by hex package id)
+    const holdings = await queryCCHoldings(POOL_OPERATOR);
 
     if (!holdings.length) {
       return res.json({ success: false, error: 'Pool operator has no CC (Amulet) holdings. Tap CC first.' });
@@ -1975,7 +2193,11 @@ app.post('/admin/seed-cc-liquidity', async (req, res) => {
 
     // Calculate total available CC
     const totalAvailable = holdings.reduce((sum, h) => {
-      const amt = parseFloat(h.createArgument?.amount?.initialAmount || '0');
+      const amt = parseFloat(
+        h.createArgument?.amount?.initialAmount ||
+        h.interfaceViews?.[0]?.viewValue?.amount ||
+        '0'
+      );
       return sum + amt;
     }, 0);
 
@@ -1993,7 +2215,7 @@ app.post('/admin/seed-cc-liquidity', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.AssetReserve:AssetReserve`,
+          templateId: `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`,
           contractId: assetReserveCid,
           choice: 'RecordDeposit',
           choiceArgument: {

@@ -1,13 +1,15 @@
 import { useState } from 'react';
 import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
-import type { PositionData, DisclosedContract } from '../types';
+import type { PositionData } from '../types';
 import { buildWithdrawTSWithPositionCommand } from '../commands/withdraw';
-import { fetchTransferContext } from '../utils/transferContext';
+import { ASSETS, type AssetKey } from '../assets';
+import { fetchPoolHoldings } from '../utils/transferContext';
 import type { SubmitTxOptions } from '../hooks/useLoop';
-import { ADMIN_API_URL, POOL_OPERATOR } from '../config';
+import { POOL_OPERATOR } from '../config';
 
 interface Props {
+  asset: AssetKey;
   partyId: string;
   position: PositionData;
   submitTx: (
@@ -20,11 +22,13 @@ interface Props {
 }
 
 export function WithdrawModal({
+  asset,
   partyId,
   position,
   submitTx,
   onClose,
 }: Props) {
+  const cfg = ASSETS[asset];
   const [amount, setAmount] = useState('');
   const [fullWithdraw, setFullWithdraw] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -32,8 +36,8 @@ export function WithdrawModal({
   const [successMessage, setSuccessMessage] = useState('');
   const [updateId, setUpdateId] = useState('');
 
-  const supplied = parseFloat(position.totalSupplied);
-  const selectedDeposit = position.depositPositions[0];
+  const supplied = parseFloat(cfg.suppliedAmount(position));
+  const selectedDeposit = cfg.depositPosition(position);
   const depositPrincipal = selectedDeposit ? parseFloat(selectedDeposit.principal) : 0;
 
   const handleSubmit = async () => {
@@ -42,27 +46,16 @@ export function WithdrawModal({
     setError('');
 
     try {
-      // For withdraw: pool is sender, user is receiver
-      const holdingResp = await fetch(`${ADMIN_API_URL}/admin/usdcx-holdings/${encodeURIComponent(POOL_OPERATOR)}`).then(r => r.json());
-      const poolHoldings = holdingResp.holdings || [];
-      const poolHoldingCids = poolHoldings.map((h: { contractId: string }) => h.contractId);
+      // Withdraw is a pool-as-sender payout: pull the pool operator's current
+      // holdings of this asset (they double as transfer inputs + disclosures, and
+      // as freshReserveHoldingCids for ephemeral assets).
+      const poolHoldings = await fetchPoolHoldings(cfg.poolHoldingsPath(POOL_OPERATOR));
 
-      const ctx = await fetchTransferContext(
-        POOL_OPERATOR,
-        fullWithdraw ? position.totalSupplied : amount,
-        poolHoldingCids.length > 0 ? poolHoldingCids : ['placeholder'],
-        partyId
+      const ctx = await cfg.fetchPoolSendContext(
+        fullWithdraw ? cfg.suppliedAmount(position) : amount,
+        partyId,
+        poolHoldings.cids.length > 0 ? poolHoldings.cids : ['placeholder']
       );
-
-      // Include pool operator's holdings as disclosed contracts
-      const holdingDisclosed: DisclosedContract[] = poolHoldings
-        .filter((h: { contractId: string; createdEventBlob?: string }) => h.contractId && h.createdEventBlob)
-        .map((h: { contractId: string; createdEventBlob: string; templateId?: string; domainId?: string }) => ({
-          templateId: h.templateId || '',
-          contractId: h.contractId,
-          createdEventBlob: h.createdEventBlob,
-          domainId: h.domainId || '',
-        }));
 
       const allDisclosed = [
         ...ctx.disclosedContracts.map((dc) => ({
@@ -71,11 +64,11 @@ export function WithdrawModal({
           createdEventBlob: dc.createdEventBlob,
           domainId: dc.domainId || dc.synchronizerId || '',
         })),
-        ...holdingDisclosed,
+        ...poolHoldings.disclosed,
       ];
       // Deduplicate
       const seen = new Set<string>();
-      const effectiveDisclosed = allDisclosed.filter(dc => {
+      const effectiveDisclosed = allDisclosed.filter((dc) => {
         if (seen.has(dc.contractId)) return false;
         seen.add(dc.contractId);
         return true;
@@ -85,13 +78,19 @@ export function WithdrawModal({
         {
           poolCid: position.poolCid,
           supplier: partyId,
-          depositPositionCid: position.depositPositions[0]?.cid || '',
-          assetReserveCid: position.assetReserveCid,
+          depositPositionCid: selectedDeposit?.cid || '',
+          assetReserveCid: cfg.reserveCid(position),
           transferFactoryCid: ctx.transferFactoryCid,
           userPositionCid: position.userPositionCid,
+          // Other reserves backing the user's collateral so the DAR's on-chain HF
+          // counts the full basket.
+          accountReserveCids: cfg.otherReserveCids(position),
+          // Ephemeral assets (CC) must pass fresh pool holdings covering full
+          // reserve liquidity (FIND-025); stable assets (USDCx) use stored holdings.
+          freshReserveHoldingCids: cfg.isEphemeral ? poolHoldings.cids : null,
           withdrawAmount: fullWithdraw ? null : amount,
           choiceContext: ctx.choiceContext,
-          reason: 'Withdraw',
+          reason: `${cfg.symbol} Withdraw`,
           featuredAppRightCid: null,
         },
         effectiveDisclosed
@@ -100,14 +99,14 @@ export function WithdrawModal({
       const result = await submitTx(
         'WithdrawTSWithPosition',
         cmd,
-        fullWithdraw ? 'Full withdrawal' : `Withdraw ${amount} USDCx`,
+        fullWithdraw ? `Full ${cfg.symbol} withdrawal` : `Withdraw ${amount} ${cfg.symbol}`,
         { estimateTraffic: false }
       );
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;
       setUpdateId(txUpdateId || '');
-      setSuccessMessage(fullWithdraw ? 'Full withdrawal completed' : `Withdrew ${amount} USDCx`);
+      setSuccessMessage(fullWithdraw ? 'Full withdrawal completed' : `Withdrew ${amount} ${cfg.symbol}`);
       await position.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -117,10 +116,10 @@ export function WithdrawModal({
   };
 
   return (
-    <ActionModal title="Withdraw USDCx" onClose={onClose} successMessage={successMessage} updateId={updateId}>
+    <ActionModal title={`Withdraw ${cfg.symbol}`} onClose={onClose} successMessage={successMessage} updateId={updateId}>
       <div className="modal-field">
         <label className="modal-label">Currently Supplied</label>
-        <div className="modal-balance">{supplied.toFixed(4)} USDCx</div>
+        <div className="modal-balance">{supplied.toFixed(4)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">
@@ -161,7 +160,7 @@ export function WithdrawModal({
         onClick={handleSubmit}
         disabled={
           submitting ||
-          position.depositPositions.length === 0 ||
+          !selectedDeposit ||
           (!fullWithdraw && (!amount || parseFloat(amount) <= 0))
         }
         className="btn-action btn-withdraw"
@@ -170,7 +169,7 @@ export function WithdrawModal({
           ? <><span className="btn-spinner" />Withdrawing...</>
           : fullWithdraw
             ? 'Withdraw All'
-            : `Withdraw ${amount || '0'} USDCx`}
+            : `Withdraw ${amount || '0'} ${cfg.symbol}`}
       </button>
     </ActionModal>
   );

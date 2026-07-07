@@ -3,10 +3,11 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildSupplyTSWithPositionCommand } from '../commands/deposit';
-import { fetchTransferContext } from '../utils/transferContext';
+import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 
 interface Props {
+  asset: AssetKey;
   partyId: string;
   position: PositionData;
   submitTx: (
@@ -18,7 +19,8 @@ interface Props {
   onClose: () => void;
 }
 
-export function SupplyModal({ partyId, position, submitTx, onClose }: Props) {
+export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Props) {
+  const cfg = ASSETS[asset];
   const [amount, setAmount] = useState('');
   const [enableAsCollateral, setEnableAsCollateral] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -26,7 +28,9 @@ export function SupplyModal({ partyId, position, submitTx, onClose }: Props) {
   const [successMessage, setSuccessMessage] = useState('');
   const [updateId, setUpdateId] = useState('');
 
-  const maxAmount = position.walletBalance;
+  const maxAmount = cfg.walletBalance(position);
+  const holdings = cfg.holdings(position);
+  const reserveCid = cfg.reserveCid(position);
 
   const handleSubmit = async () => {
     if (!amount || parseFloat(amount) <= 0) return;
@@ -34,22 +38,22 @@ export function SupplyModal({ partyId, position, submitTx, onClose }: Props) {
     setError('');
 
     try {
-      const holdingCids = position.usdcxHoldings.map((h) => h.contractId);
+      const holdingCids = holdings.map((h) => h.contractId);
 
       const missingCids: string[] = [];
       if (!position.poolCid) missingCids.push('poolCid');
-      if (!position.assetReserveCid) missingCids.push('assetReserveCid');
+      if (!reserveCid) missingCids.push(`${cfg.symbol} reserve`);
       if (!position.userPositionCid) missingCids.push('userPositionCid');
       if (holdingCids.length === 0 || holdingCids.some((c) => !c))
-        missingCids.push('holdingCids');
+        missingCids.push(`${cfg.symbol} holdings`);
       if (missingCids.length > 0) {
         throw new Error(`Missing contract IDs: ${missingCids.join(', ')}. Try refreshing.`);
       }
 
-      const ctx = await fetchTransferContext(partyId, amount, holdingCids);
+      const ctx = await cfg.fetchUserSendContext(partyId, amount, holdingCids);
 
       if (!ctx.transferFactoryCid) {
-        throw new Error('TransferFactory contract ID not found. Check server logs.');
+        throw new Error(`${cfg.symbol} TransferFactory contract ID not found. Check server logs.`);
       }
 
       const effectiveDisclosed = ctx.disclosedContracts
@@ -68,25 +72,25 @@ export function SupplyModal({ partyId, position, submitTx, onClose }: Props) {
           supplyAmount: amount,
           holdingCids,
           transferFactoryCid: ctx.transferFactoryCid,
-          assetReserveCid: position.assetReserveCid,
+          assetReserveCid: reserveCid,
           userPositionCid: position.userPositionCid,
           enableAsCollateral,
           existingDepositCid: null,
           choiceContext: ctx.choiceContext,
-          reason: 'USDCx Supply',
+          reason: `${cfg.symbol} Supply`,
           featuredAppRightCid: null,
         },
         effectiveDisclosed
       );
 
-      const result = await submitTx('SupplyTSWithPosition', cmd, `Supply ${amount} USDCx`, {
+      const result = await submitTx('SupplyTSWithPosition', cmd, `Supply ${amount} ${cfg.symbol}`, {
         estimateTraffic: false,
       });
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;
       setUpdateId(txUpdateId || '');
-      setSuccessMessage(`Supplied ${amount} USDCx`);
+      setSuccessMessage(`Supplied ${amount} ${cfg.symbol}`);
       await position.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -96,10 +100,10 @@ export function SupplyModal({ partyId, position, submitTx, onClose }: Props) {
   };
 
   return (
-    <ActionModal title="Supply USDCx" onClose={onClose} successMessage={successMessage} updateId={updateId}>
+    <ActionModal title={`Supply ${cfg.symbol}`} onClose={onClose} successMessage={successMessage} updateId={updateId}>
       <div className="modal-field">
         <label className="modal-label">Available Balance</label>
-        <div className="modal-balance">{parseFloat(maxAmount).toFixed(4)} USDCx</div>
+        <div className="modal-balance">{parseFloat(maxAmount).toFixed(4)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">
@@ -141,13 +145,13 @@ export function SupplyModal({ partyId, position, submitTx, onClose }: Props) {
           !amount ||
           parseFloat(amount) <= 0 ||
           !position.poolCid ||
-          !position.assetReserveCid ||
+          !reserveCid ||
           !position.userPositionCid ||
-          position.usdcxHoldings.length === 0
+          holdings.length === 0
         }
         className="btn-action btn-supply"
       >
-        {submitting ? <><span className="btn-spinner" />Supplying...</> : `Supply ${amount || '0'} USDCx`}
+        {submitting ? <><span className="btn-spinner" />Supplying...</> : `Supply ${amount || '0'} ${cfg.symbol}`}
       </button>
     </ActionModal>
   );

@@ -1,6 +1,6 @@
 export const LENDING_PACKAGE_ID =
   import.meta.env.VITE_LENDING_PACKAGE_ID ||
-  'baebb56bce57c315a3b834613c8dd5cf968b6e0d5d717fb0b7f6cb0ac4847685';
+  'bb52e57aa7690fc7b711ecb0682d1efcee4590fa81888a6b42a1f77fdca68ca5';
 
 export const SCAN_API_URL =
   import.meta.env.VITE_SCAN_API_URL || 'http://test.canton.palladiumlabs.org:4000';

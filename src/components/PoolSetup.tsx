@@ -378,7 +378,7 @@ export function PoolSetup({ partyId, submitTx, addLog }: Props) {
             feedId: priceFeedId,
             priceValue,
           }, 'SetUSDCxPrice')}
-          disabled={!oracleCid || !priceFeedId || adminLoading === 'SetUSDCxPrice'}
+          disabled={!priceFeedId || adminLoading === 'SetUSDCxPrice'}
           className="btn btn-primary"
           style={{ marginBottom: 12 }}
         >
@@ -402,7 +402,7 @@ export function PoolSetup({ partyId, submitTx, addLog }: Props) {
             feedId: ccPriceFeedId,
             priceValue: ccPriceValue,
           }, 'SetCCPrice')}
-          disabled={!oracleCid || !ccPriceFeedId || adminLoading === 'SetCCPrice'}
+          disabled={!ccPriceFeedId || adminLoading === 'SetCCPrice'}
           className="btn btn-primary"
         >
           {adminLoading === 'SetCCPrice' ? 'Setting...' : 'Set CC Price (Admin)'}

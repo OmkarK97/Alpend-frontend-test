@@ -3,10 +3,11 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildRepayTSWithPositionCommand } from '../commands/repay';
-import { fetchTransferContext } from '../utils/transferContext';
+import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 
 interface Props {
+  asset: AssetKey;
   partyId: string;
   position: PositionData;
   submitTx: (
@@ -18,7 +19,8 @@ interface Props {
   onClose: () => void;
 }
 
-export function RepayModal({ partyId, position, submitTx, onClose }: Props) {
+export function RepayModal({ asset, partyId, position, submitTx, onClose }: Props) {
+  const cfg = ASSETS[asset];
   const [amount, setAmount] = useState('');
   const [fullRepay, setFullRepay] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -26,28 +28,24 @@ export function RepayModal({ partyId, position, submitTx, onClose }: Props) {
   const [successMessage, setSuccessMessage] = useState('');
   const [updateId, setUpdateId] = useState('');
 
-  const borrowed = parseFloat(position.totalBorrowed);
-  const walletBal = parseFloat(position.walletBalance);
+  const borrowed = parseFloat(cfg.borrowedAmount(position));
+  const walletBal = parseFloat(cfg.walletBalance(position));
+  const holdings = cfg.holdings(position);
+  const borrowPos = cfg.borrowPosition(position);
 
   const handleSubmit = async () => {
-    console.log('[RepayModal] handleSubmit called, fullRepay:', fullRepay, 'amount:', amount);
-    if (!fullRepay && (!amount || parseFloat(amount) <= 0)) {
-      console.log('[RepayModal] early return: no amount');
-      return;
-    }
+    if (!fullRepay && (!amount || parseFloat(amount) <= 0)) return;
     setSubmitting(true);
     setError('');
 
     try {
-      const holdingCids = position.usdcxHoldings.map((h) => h.contractId);
-      console.log('[RepayModal] holdingCids:', holdingCids.length);
+      const holdingCids = holdings.map((h) => h.contractId);
 
-      const ctx = await fetchTransferContext(
+      const ctx = await cfg.fetchUserSendContext(
         partyId,
-        fullRepay ? position.totalBorrowed : amount,
+        fullRepay ? cfg.borrowedAmount(position) : amount,
         holdingCids
       );
-      console.log('[RepayModal] transferContext fetched, transferFactoryCid:', ctx.transferFactoryCid?.substring(0, 30));
 
       const effectiveDisclosed = ctx.disclosedContracts.map((dc) => ({
         templateId: dc.templateId || '',
@@ -56,62 +54,52 @@ export function RepayModal({ partyId, position, submitTx, onClose }: Props) {
         domainId: dc.domainId || dc.synchronizerId || '',
       }));
 
-      const borrowPos = position.borrowPositions[0];
-      console.log('[RepayModal] borrowPos:', borrowPos?.cid?.substring(0, 30), 'principal:', borrowPos?.principal);
-
       const cmd = buildRepayTSWithPositionCommand(
         {
           poolCid: position.poolCid,
           borrower: partyId,
           borrowPositionCid: borrowPos?.cid || '',
           repaymentHoldingCids: holdingCids,
-          assetReserveCid: position.assetReserveCid,
+          assetReserveCid: cfg.reserveCid(position),
           transferFactoryCid: ctx.transferFactoryCid,
           userPositionCid: position.userPositionCid,
           repayAmount: fullRepay ? null : amount,
           choiceContext: ctx.choiceContext,
-          reason: 'Repay',
+          reason: `${cfg.symbol} Repay`,
           featuredAppRightCid: null,
         },
         effectiveDisclosed
       );
 
-      console.log('[RepayModal] calling submitTx...');
       const result = await submitTx(
         'RepayTSWithPosition',
         cmd,
-        fullRepay ? 'Full repayment' : `Repay ${amount} USDCx`,
+        fullRepay ? `Full ${cfg.symbol} repayment` : `Repay ${amount} ${cfg.symbol}`,
         { estimateTraffic: false }
       );
-      console.log('[RepayModal] submitTx returned:', JSON.stringify(result));
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;
-      console.log('[RepayModal] extracted updateId:', txUpdateId);
       setUpdateId(txUpdateId || '');
-      setSuccessMessage(fullRepay ? 'Full repayment completed' : `Repaid ${amount} USDCx`);
-      console.log('[RepayModal] SUCCESS - set successMessage');
+      setSuccessMessage(fullRepay ? 'Full repayment completed' : `Repaid ${amount} ${cfg.symbol}`);
       await position.refresh();
-      console.log('[RepayModal] position refreshed');
     } catch (err) {
-      console.log('[RepayModal] CATCH error:', err);
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      console.log('[RepayModal] FINALLY - setting submitting=false');
       setSubmitting(false);
     }
   };
 
   return (
-    <ActionModal title="Repay USDCx" onClose={onClose} successMessage={successMessage} updateId={updateId}>
+    <ActionModal title={`Repay ${cfg.symbol}`} onClose={onClose} successMessage={successMessage} updateId={updateId}>
       <div className="modal-field">
         <label className="modal-label">Outstanding Debt</label>
-        <div className="modal-balance">{borrowed.toFixed(4)} USDCx</div>
+        <div className="modal-balance">{borrowed.toFixed(4)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">
         <label className="modal-label">Wallet Balance</label>
-        <div className="modal-balance-sm">{walletBal.toFixed(4)} USDCx</div>
+        <div className="modal-balance-sm">{walletBal.toFixed(4)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">
@@ -154,8 +142,8 @@ export function RepayModal({ partyId, position, submitTx, onClose }: Props) {
         onClick={handleSubmit}
         disabled={
           submitting ||
-          position.borrowPositions.length === 0 ||
-          position.usdcxHoldings.length === 0 ||
+          !borrowPos ||
+          holdings.length === 0 ||
           (!fullRepay && (!amount || parseFloat(amount) <= 0))
         }
         className="btn-action btn-repay"
@@ -164,7 +152,7 @@ export function RepayModal({ partyId, position, submitTx, onClose }: Props) {
           ? <><span className="btn-spinner" />Repaying...</>
           : fullRepay
             ? 'Repay All'
-            : `Repay ${amount || '0'} USDCx`}
+            : `Repay ${amount || '0'} ${cfg.symbol}`}
       </button>
     </ActionModal>
   );
