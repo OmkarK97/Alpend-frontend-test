@@ -8,7 +8,6 @@ import { SupplyModal } from './SupplyModal';
 import { BorrowModal } from './BorrowModal';
 import { WithdrawModal } from './WithdrawModal';
 import { RepayModal } from './RepayModal';
-import { OpenVaultModal } from './OpenVaultModal';
 
 type ModalType =
   | 'supply'
@@ -16,7 +15,6 @@ type ModalType =
   | 'withdraw'
   | 'repay'
   | 'cc-supply'
-  | 'open-vault'
   | 'cc-withdraw'
   | 'cc-borrow'
   | 'cc-repay'
@@ -164,23 +162,6 @@ export function Dashboard({
             {position.healthFactor || '--'}
           </span>
         </div>
-      </div>
-
-      {/* One Protocol — Loop-signed Open Vault (CDP) */}
-      <div className="init-banner">
-        <div className="init-banner-content">
-          <h3>One Protocol — Open Vault</h3>
-          <p>
-            Create an <code>ExternalOpenVaultRequest</code> signed directly by
-            your Loop wallet. No transfer flow.
-          </p>
-        </div>
-        <button
-          onClick={() => setActiveModal('open-vault')}
-          className="btn-action btn-borrow"
-        >
-          Open Vault
-        </button>
       </div>
 
       {/* Initialize Position Banner */}
@@ -477,14 +458,6 @@ export function Dashboard({
           asset="cc"
           partyId={partyId}
           position={position}
-          submitTx={submitTx}
-          onClose={() => setActiveModal(null)}
-        />
-      )}
-      {activeModal === 'open-vault' && (
-        <OpenVaultModal
-          partyId={partyId}
-          provider={provider}
           submitTx={submitTx}
           onClose={() => setActiveModal(null)}
         />

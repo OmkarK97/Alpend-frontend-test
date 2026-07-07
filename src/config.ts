@@ -67,39 +67,3 @@ export const POOL_OPERATOR =
 export const EXPLORER_URL =
   import.meta.env.VITE_EXPLORER_URL ||
   'https://lighthouse.testnet.cantonloop.com/transactions';
-
-// =============================================
-// One Protocol (CDP) config
-// Used for the direct, Loop-signed `ExternalOpenVaultRequest` flow.
-// This is a separate Daml package from the Lending package above.
-// =============================================
-
-export const ONE_PACKAGE_ID =
-  import.meta.env.VITE_ONE_PACKAGE_ID ||
-  '35491e0719e5ee76b6b59193cc7f9a6dea9df18d97bdea611b5f69225e7de76d';
-
-// Backend service party that observes the request and later settles it.
-export const ONE_PROTOCOL_PARTY =
-  import.meta.env.VITE_ONE_PROTOCOL_PARTY ||
-  'google-oauth2_007c102908799751727857785::12206d5dbed87522889b28486cea3dd6b6c1fc4b3ca156d2c4f31318710fcba57be3';
-
-// Live CollateralType on the target testnet (see PQS active CollateralType).
-export const ONE_COLLATERAL_TYPE_ID =
-  import.meta.env.VITE_ONE_COLLATERAL_TYPE_ID || 'CC';
-
-// Atomic-unit scaling. CC collateral uses 10 decimals; $ONE debt uses 6.
-export const ONE_COLLATERAL_DECIMALS = Number(
-  import.meta.env.VITE_ONE_COLLATERAL_DECIMALS || '10'
-);
-
-export const ONE_DEBT_DECIMALS = Number(
-  import.meta.env.VITE_ONE_DEBT_DECIMALS || '6'
-);
-
-export const ONE_FACTORY_TEMPLATES = {
-  externalOpenVaultRequest: `${ONE_PACKAGE_ID}:One.V1.Factory:ExternalOpenVaultRequest`,
-} as const;
-
-// One Protocol gateway — settles the owner-signed request as the protocol party.
-export const ONE_GATEWAY_URL =
-  import.meta.env.VITE_ONE_GATEWAY_URL || 'http://127.0.0.1:8081';
