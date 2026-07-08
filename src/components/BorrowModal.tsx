@@ -4,7 +4,7 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildBorrowTSWithPositionCommand } from '../commands/borrow';
 import { ASSETS, type AssetKey } from '../assets';
-import { fetchPoolHoldings } from '../utils/transferContext';
+import { fetchPoolHoldings, poolCidFromDisclosed } from '../utils/transferContext';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { ADMIN_API_URL, POOL_OPERATOR } from '../config';
 
@@ -130,7 +130,7 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
 
       const cmd = buildBorrowTSWithPositionCommand(
         {
-          poolCid: position.poolCid,
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
           borrower: partyId,
           borrowAmount: amount,
           borrowAssetReserveCid: reserveCid,

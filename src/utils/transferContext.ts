@@ -10,6 +10,24 @@ export interface TransferContext {
   disclosedContracts: DisclosedContract[];
 }
 
+/**
+ * The LendingPool CID a command exercises on MUST match the pool disclosed in that same
+ * command, and must be the CURRENT one — the pool CID churns whenever a consuming admin
+ * choice runs (e.g. UpdateOracleCid on every SetPrice / oracle sync). Trusting a cached
+ * `position.poolCid` causes `CONTRACT_NOT_FOUND` until a hard refresh. Since the freshly
+ * fetched disclosed set already carries the current pool, take the CID from there so the
+ * exercise target can never disagree with what's disclosed. Falls back to the cached cid.
+ */
+export function poolCidFromDisclosed(
+  disclosed: DisclosedContract[],
+  fallback: string
+): string {
+  const pool = disclosed.find((dc) =>
+    (dc.templateId || '').includes('Lending.Pool:LendingPool')
+  );
+  return pool?.contractId || fallback;
+}
+
 export async function fetchTransferContext(
   sender: string,
   amount: string,

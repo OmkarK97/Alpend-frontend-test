@@ -4,7 +4,7 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildWithdrawTSWithPositionCommand } from '../commands/withdraw';
 import { ASSETS, type AssetKey } from '../assets';
-import { fetchPoolHoldings } from '../utils/transferContext';
+import { fetchPoolHoldings, poolCidFromDisclosed } from '../utils/transferContext';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { POOL_OPERATOR } from '../config';
 
@@ -76,7 +76,7 @@ export function WithdrawModal({
 
       const cmd = buildWithdrawTSWithPositionCommand(
         {
-          poolCid: position.poolCid,
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
           supplier: partyId,
           depositPositionCid: selectedDeposit?.cid || '',
           assetReserveCid: cfg.reserveCid(position),

@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { PaymentRequiredError } from '@fivenorth/loop-sdk';
 import {
   initLoop,
   connectLoop,
@@ -197,7 +198,13 @@ export function useLoop() {
         return { _extractedUpdateId: txUpdateId };
       } catch (err) {
         console.log('[submitTx] CATCH block, error:', err);
-        const errMsg = err instanceof Error ? err.message : String(err);
+        // 0.12+ after-execution gas model: the SDK throws PaymentRequiredError (402)
+        // when network gas is due. Surface a clear message rather than a raw 402.
+        // (Paying it is a server-SDK concern — checkDueGas/payGas — not the client.)
+        let errMsg = err instanceof Error ? err.message : String(err);
+        if (err instanceof PaymentRequiredError) {
+          errMsg = `Network gas payment required before this action can settle. ${err.message || ''}`.trim();
+        }
         addLog(operation, 'error', `Failed: ${errMsg}`, err);
         throw err;
       }

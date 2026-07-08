@@ -3,6 +3,7 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildRepayTSWithPositionCommand } from '../commands/repay';
+import { poolCidFromDisclosed } from '../utils/transferContext';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 
@@ -56,7 +57,7 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
 
       const cmd = buildRepayTSWithPositionCommand(
         {
-          poolCid: position.poolCid,
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
           borrower: partyId,
           borrowPositionCid: borrowPos?.cid || '',
           repaymentHoldingCids: holdingCids,

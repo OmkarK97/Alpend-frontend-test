@@ -3,6 +3,7 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildSupplyTSWithPositionCommand } from '../commands/deposit';
+import { poolCidFromDisclosed } from '../utils/transferContext';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 
@@ -67,7 +68,7 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
 
       const cmd = buildSupplyTSWithPositionCommand(
         {
-          poolCid: position.poolCid,
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
           supplier: partyId,
           supplyAmount: amount,
           holdingCids,
