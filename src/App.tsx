@@ -5,6 +5,7 @@ import { ConnectWallet } from './components/ConnectWallet';
 import { Dashboard } from './components/Dashboard';
 import { AdminPage } from './components/AdminPage';
 import { TransferPage } from './components/TransferPage';
+import { LiquidationsPage } from './components/LiquidationsPage';
 import { TransactionLog } from './components/TransactionLog';
 
 export default function App() {
@@ -32,6 +33,7 @@ export default function App() {
 
   const isAdmin = route === '#/admin';
   const isTransfer = route === '#/transfer';
+  const isLiquidations = route === '#/liquidations';
 
   return (
     <div className="app">
@@ -44,9 +46,15 @@ export default function App() {
         <nav className="header-nav">
           <a
             href="#/"
-            className={`header-link ${!isAdmin && !isTransfer ? 'header-link-active' : ''}`}
+            className={`header-link ${!isAdmin && !isTransfer && !isLiquidations ? 'header-link-active' : ''}`}
           >
             Dashboard
+          </a>
+          <a
+            href="#/liquidations"
+            className={`header-link ${isLiquidations ? 'header-link-active' : ''}`}
+          >
+            Liquidations
           </a>
           <a
             href="#/transfer"
@@ -95,6 +103,12 @@ export default function App() {
             provider={provider}
             submitTx={submitTx}
             addLog={addLog}
+          />
+        ) : isLiquidations ? (
+          <LiquidationsPage
+            partyId={partyId}
+            position={position}
+            submitTx={submitTx}
           />
         ) : (
           <Dashboard

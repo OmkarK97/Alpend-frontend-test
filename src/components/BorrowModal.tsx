@@ -4,7 +4,7 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildBorrowTSWithPositionCommand } from '../commands/borrow';
 import { ASSETS, type AssetKey } from '../assets';
-import { fetchPoolHoldings, poolCidFromDisclosed } from '../utils/transferContext';
+import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { ADMIN_API_URL, POOL_OPERATOR } from '../config';
 
@@ -128,17 +128,23 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
         return true;
       });
 
+      // Re-resolve current CIDs (reserve/user-position churn between refreshes).
+      const live = await fetchLiveCids(partyId);
+      const accountReserveCids = Object.entries(live.reservesByInstrument)
+        .filter(([id]) => id !== cfg.instrumentId)
+        .map(([, cid]) => cid);
+
       const cmd = buildBorrowTSWithPositionCommand(
         {
-          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, live.poolCid || position.poolCid),
           borrower: partyId,
           borrowAmount: amount,
-          borrowAssetReserveCid: reserveCid,
+          borrowAssetReserveCid: live.reservesByInstrument[cfg.instrumentId] || reserveCid,
           transferFactoryCid: ctx.transferFactoryCid,
-          userPositionCid: position.userPositionCid,
+          userPositionCid: live.userPositionCid || position.userPositionCid,
           // Other reserves backing the user's collateral so the DAR's on-chain HF
           // counts the full basket.
-          accountReserveCids: cfg.otherReserveCids(position),
+          accountReserveCids,
           existingBorrowCid: null,
           // Ephemeral assets (CC) must pass fresh pool holdings covering full reserve
           // liquidity (FIND-025); stable assets (USDCx) use stored holdings.

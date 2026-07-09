@@ -3,7 +3,8 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildRepayTSWithPositionCommand } from '../commands/repay';
-import { poolCidFromDisclosed } from '../utils/transferContext';
+import { poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { HealthFactorPreview } from './HealthFactorPreview';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 
@@ -34,6 +35,15 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
   const holdings = cfg.holdings(position);
   const borrowPos = cfg.borrowPosition(position);
 
+  // Post-repay health-factor projection (repaying debt raises HF).
+  const info = position.assetInfo[cfg.instrumentId] || { price: 0, ltv: 0, liqThreshold: 0 };
+  const borrowedUSD = parseFloat(position.totalBorrowed);
+  const liqThreshUSD = parseFloat(position.totalLiqThresholdCollateralUSD);
+  const repayAmt = fullRepay ? borrowed : parseFloat(amount) || 0;
+  const newBorrowedUSD = Math.max(0, borrowedUSD - repayAmt * info.price);
+  const currentHF = borrowedUSD > 0.01 ? liqThreshUSD / borrowedUSD : null;
+  const projectedHF = newBorrowedUSD > 0.01 ? liqThreshUSD / newBorrowedUSD : null;
+
   const handleSubmit = async () => {
     if (!fullRepay && (!amount || parseFloat(amount) <= 0)) return;
     setSubmitting(true);
@@ -55,15 +65,18 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
         domainId: dc.domainId || dc.synchronizerId || '',
       }));
 
+      // Re-resolve current CIDs (reserve/borrow/user-position churn between refreshes).
+      const live = await fetchLiveCids(partyId);
+
       const cmd = buildRepayTSWithPositionCommand(
         {
-          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, live.poolCid || position.poolCid),
           borrower: partyId,
-          borrowPositionCid: borrowPos?.cid || '',
+          borrowPositionCid: live.borrowsByInstrument[cfg.instrumentId] || borrowPos?.cid || '',
           repaymentHoldingCids: holdingCids,
-          assetReserveCid: cfg.reserveCid(position),
+          assetReserveCid: live.reservesByInstrument[cfg.instrumentId] || cfg.reserveCid(position),
           transferFactoryCid: ctx.transferFactoryCid,
-          userPositionCid: position.userPositionCid,
+          userPositionCid: live.userPositionCid || position.userPositionCid,
           repayAmount: fullRepay ? null : amount,
           choiceContext: ctx.choiceContext,
           reason: `${cfg.symbol} Repay`,
@@ -135,6 +148,10 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
             </button>
           </div>
         </div>
+      )}
+
+      {borrowedUSD > 0.01 && (
+        <HealthFactorPreview current={currentHF} projected={projectedHF} showProjected={repayAmt > 0} />
       )}
 
       {error && <div className="modal-error">{error}</div>}

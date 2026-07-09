@@ -3,7 +3,8 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildSupplyTSWithPositionCommand } from '../commands/deposit';
-import { poolCidFromDisclosed } from '../utils/transferContext';
+import { poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { HealthFactorPreview } from './HealthFactorPreview';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 
@@ -32,6 +33,16 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
   const maxAmount = cfg.walletBalance(position);
   const holdings = cfg.holdings(position);
   const reserveCid = cfg.reserveCid(position);
+
+  // Post-supply health-factor projection (supplying collateral raises HF).
+  const info = position.assetInfo[cfg.instrumentId] || { price: 0, ltv: 0, liqThreshold: 0 };
+  const borrowedUSD = parseFloat(position.totalBorrowed);
+  const liqThreshUSD = parseFloat(position.totalLiqThresholdCollateralUSD);
+  const inputAmount = parseFloat(amount) || 0;
+  const currentHF = borrowedUSD > 0.01 ? liqThreshUSD / borrowedUSD : null;
+  const projectedHF = borrowedUSD > 0.01
+    ? (liqThreshUSD + (enableAsCollateral ? inputAmount * info.price * info.liqThreshold : 0)) / borrowedUSD
+    : null;
 
   const handleSubmit = async () => {
     if (!amount || parseFloat(amount) <= 0) return;
@@ -66,15 +77,18 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
           domainId: dc.domainId || dc.synchronizerId || '',
         }));
 
+      // Re-resolve current CIDs (reserve/user-position churn between refreshes).
+      const live = await fetchLiveCids(partyId);
+
       const cmd = buildSupplyTSWithPositionCommand(
         {
-          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, live.poolCid || position.poolCid),
           supplier: partyId,
           supplyAmount: amount,
           holdingCids,
           transferFactoryCid: ctx.transferFactoryCid,
-          assetReserveCid: reserveCid,
-          userPositionCid: position.userPositionCid,
+          assetReserveCid: live.reservesByInstrument[cfg.instrumentId] || reserveCid,
+          userPositionCid: live.userPositionCid || position.userPositionCid,
           enableAsCollateral,
           existingDepositCid: null,
           choiceContext: ctx.choiceContext,
@@ -136,6 +150,10 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
           Use as collateral
         </label>
       </div>
+
+      {borrowedUSD > 0.01 && (
+        <HealthFactorPreview current={currentHF} projected={projectedHF} showProjected={inputAmount > 0} />
+      )}
 
       {error && <div className="modal-error">{error}</div>}
 

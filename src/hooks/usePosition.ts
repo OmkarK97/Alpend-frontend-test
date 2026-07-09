@@ -34,6 +34,9 @@ export function usePosition(
   const [ccSupplied, setCcSupplied] = useState('0.00');
   const [ccBorrowed, setCcBorrowed] = useState('0.00');
   const [healthFactor, setHealthFactor] = useState<string | null>(null);
+  const [assetInfo, setAssetInfo] = useState<
+    Record<string, { price: number; ltv: number; liqThreshold: number }>
+  >({});
   const [walletBalance, setWalletBalance] = useState('0.00');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -486,6 +489,7 @@ export function usePosition(
           ? (liqThreshUSD / borrowedUSD).toFixed(2)
           : null
       );
+      setAssetInfo(assetInfo);
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Failed to fetch position data'
@@ -527,6 +531,7 @@ export function usePosition(
     totalWeightedCollateralUSD,
     totalLiqThresholdCollateralUSD,
     healthFactor,
+    assetInfo,
     walletBalance,
     ccWalletBalance,
     usdcxSupplied,

@@ -11,6 +11,55 @@ export interface TransferContext {
 }
 
 /**
+ * Live contract CIDs for a party, fetched fresh at submit time. `position` (from usePosition)
+ * is only as fresh as its last refresh, but reserve CIDs churn on every accrue/action by ANY
+ * user and the UserPosition CID churns on every action — so a command that references cached
+ * CIDs can hit CONTRACT_NOT_FOUND. Re-resolve them here right before building the command.
+ */
+export interface LiveCids {
+  poolCid: string;
+  userPositionCid: string;
+  reservesByInstrument: Record<string, string>; // instrumentId.id -> current reserve cid
+  depositsByInstrument: Record<string, string>;  // instrumentId.id -> current deposit cid
+  borrowsByInstrument: Record<string, string>;   // instrumentId.id -> current borrow cid
+}
+
+export async function fetchLiveCids(partyId: string): Promise<LiveCids> {
+  const [poolResp, arResp, upResp, depResp, borResp] = await Promise.all([
+    fetch(`${ADMIN_API_URL}/query/lending-pool`).then((r) => r.json()).catch(() => ({ contracts: [] })),
+    fetch(`${ADMIN_API_URL}/admin/asset-reserves`).then((r) => r.json()).catch(() => ({ contracts: [] })),
+    fetch(`${ADMIN_API_URL}/query/user-position/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ contracts: [] })),
+    fetch(`${ADMIN_API_URL}/query/deposit-position/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ contracts: [] })),
+    fetch(`${ADMIN_API_URL}/query/borrow-position/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ contracts: [] })),
+  ]);
+
+  type C = { contractId: string; createArgument?: { user?: string; instrumentId?: { id?: string } } };
+  const poolC: C[] = poolResp.contracts || [];
+  const poolCid = poolC[poolC.length - 1]?.contractId || '';
+
+  const upC: C[] = (upResp.contracts || []).filter((c: C) => c.createArgument?.user === partyId);
+  const userPositionCid = (upC[upC.length - 1] || (upResp.contracts || [])[(upResp.contracts || []).length - 1])?.contractId || '';
+
+  const reservesByInstrument: Record<string, string> = {};
+  for (const c of (arResp.contracts || []) as C[]) {
+    const id = c.createArgument?.instrumentId?.id;
+    if (id) reservesByInstrument[id] = c.contractId; // last active wins (queryContracts returns active)
+  }
+  const depositsByInstrument: Record<string, string> = {};
+  for (const c of (depResp.contracts || []) as C[]) {
+    const id = c.createArgument?.instrumentId?.id;
+    if (id && !depositsByInstrument[id]) depositsByInstrument[id] = c.contractId;
+  }
+  const borrowsByInstrument: Record<string, string> = {};
+  for (const c of (borResp.contracts || []) as C[]) {
+    const id = c.createArgument?.instrumentId?.id;
+    if (id && !borrowsByInstrument[id]) borrowsByInstrument[id] = c.contractId;
+  }
+
+  return { poolCid, userPositionCid, reservesByInstrument, depositsByInstrument, borrowsByInstrument };
+}
+
+/**
  * The LendingPool CID a command exercises on MUST match the pool disclosed in that same
  * command, and must be the CURRENT one — the pool CID churns whenever a consuming admin
  * choice runs (e.g. UpdateOracleCid on every SetPrice / oracle sync). Trusting a cached

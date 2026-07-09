@@ -338,6 +338,12 @@ app.get('/admin/pool-status', async (req, res) => {
         cid: latestPool.contractId,
         observers: latestPool.createArgument?.observers,
         assetReserveKeys: latestPool.createArgument?.assetReserveKeys,
+        pauseFlags: {
+          pauseDeposits: latestPool.createArgument?.pauseDeposits ?? false,
+          pauseWithdrawals: latestPool.createArgument?.pauseWithdrawals ?? false,
+          pauseBorrows: latestPool.createArgument?.pauseBorrows ?? false,
+          pauseLiquidations: latestPool.createArgument?.pauseLiquidations ?? false,
+        },
       } : null,
       assetReserves: reserveContracts.map(r => ({
         cid: r.contractId,
@@ -805,6 +811,347 @@ app.get('/admin/asset-reserves', async (req, res) => {
     res.json({ success: true, contracts });
   } catch (e) {
     console.error('QUERY ASSET RESERVES error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/refresh-holdings — reconcile a reserve's on-chain custody.
+ *  The reserve's stored `reserveHoldingCids` drift over time (holdings get archived by
+ *  merges/decay/manual transfers), and `totalLiquidity` drifts above the real balance via
+ *  holding-fee decay. This exercises `AssetReserve.RefreshHoldings` with the pool operator's
+ *  CURRENT live holdings of the asset — re-pointing `reserveHoldingCids` at live contracts and
+ *  rebooking `totalLiquidity` from the real amounts — then updates the pool's reserve reference
+ *  (RefreshHoldings is consuming, so the reserve CID changes). Body: { instrumentIdId } e.g. "USDCx" / "Amulet".
+ */
+app.post('/admin/refresh-holdings', async (req, res) => {
+  try {
+    const { instrumentIdId } = req.body;
+    if (!instrumentIdId) {
+      return res.status(400).json({ success: false, error: 'instrumentIdId is required (e.g. "USDCx" or "Amulet")' });
+    }
+
+    // Resolve the current reserve for this instrument (+ its feed id, for the pool re-point).
+    const reserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
+    const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
+    if (!reserve) {
+      return res.status(404).json({ success: false, error: `No AssetReserve found for instrument ${instrumentIdId}` });
+    }
+    const feedId = reserve.createArgument?.riskParams?.priceFeedId;
+    const oldTotalLiquidity = reserve.createArgument?.totalLiquidity;
+
+    // Pool operator's live holdings of this instrument.
+    const holdingContracts = await queryContractsByInterface(HOLDING_INTERFACE, POOL_OPERATOR);
+    const holdings = holdingContracts.filter((c) => {
+      const id = c.createArgument?.instrumentId?.id || c.interfaceViews?.[0]?.viewValue?.instrumentId?.id;
+      return id === instrumentIdId;
+    });
+    const freshHoldingCids = holdings.map((c) => c.contractId).filter(Boolean);
+    if (freshHoldingCids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Pool operator holds no live ${instrumentIdId} holdings — refusing to refresh totalLiquidity to 0`,
+      });
+    }
+    const newTotalLiquidity = holdings.reduce((s, c) => {
+      const amt = c.createArgument?.amount?.initialAmount || c.interfaceViews?.[0]?.viewValue?.amount || c.createArgument?.amount || '0';
+      return s + parseFloat(amt);
+    }, 0);
+
+    // RefreshHoldings (consuming) → new reserve CID with reconciled holdings + totalLiquidity.
+    const refreshResult = await submitCommand([
+      {
+        ExerciseCommand: {
+          templateId: `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`,
+          contractId: reserve.contractId,
+          choice: 'RefreshHoldings',
+          choiceArgument: { freshHoldingCids },
+        },
+      },
+    ], [POOL_OPERATOR]);
+    const newReserveCid = extractContractId(refreshResult);
+
+    // Re-point the pool at the new reserve CID (feed-keyed).
+    let newPoolCid = null;
+    if (newReserveCid && feedId) {
+      const pools = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR);
+      const pool = pools[pools.length - 1];
+      if (pool?.contractId) {
+        const upd = await submitCommand([
+          {
+            ExerciseCommand: {
+              templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+              contractId: pool.contractId,
+              choice: 'UpdateAssetReserveCid',
+              choiceArgument: { feedId, newReserveCid },
+            },
+          },
+        ], [POOL_OPERATOR]);
+        newPoolCid = extractContractId(upd);
+      }
+    }
+
+    console.log(`RefreshHoldings ${instrumentIdId}: liquidity ${oldTotalLiquidity} -> ${newTotalLiquidity}, cids=${freshHoldingCids.length}, reserve=${newReserveCid}, pool=${newPoolCid}`);
+    res.json({
+      success: true,
+      instrumentIdId,
+      feedId,
+      freshHoldingCids,
+      oldTotalLiquidity,
+      newTotalLiquidity: String(newTotalLiquidity),
+      newReserveCid,
+      newPoolCid,
+      updateId: refreshResult.transaction?.updateId || refreshResult.updateId,
+    });
+  } catch (e) {
+    console.error('REFRESH HOLDINGS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** Exercise a consuming admin choice on the current AssetReserve for `instrumentIdId`, then
+ *  re-point the pool at the new reserve CID (feed-keyed). Shared by update-risk-params /
+ *  update-interest-params (RefreshHoldings has its own copy with holdings-specific logic). */
+async function exerciseReserveChoiceAndRepoint(instrumentIdId, choice, choiceArgument) {
+  const RESERVE_TID = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
+  const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+  const reserves = await queryContracts(RESERVE_TID, POOL_OPERATOR);
+  const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
+  if (!reserve) throw new Error(`No AssetReserve found for instrument ${instrumentIdId}`);
+  const feedId = reserve.createArgument?.riskParams?.priceFeedId;
+
+  const exResult = await submitCommand([
+    { ExerciseCommand: { templateId: RESERVE_TID, contractId: reserve.contractId, choice, choiceArgument } },
+  ], [POOL_OPERATOR]);
+  const newReserveCid = extractContractId(exResult);
+
+  let newPoolCid = null;
+  if (newReserveCid && feedId) {
+    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pool = pools[pools.length - 1];
+    if (pool?.contractId) {
+      const upd = await submitCommand([
+        { ExerciseCommand: { templateId: POOL_TID, contractId: pool.contractId, choice: 'UpdateAssetReserveCid', choiceArgument: { feedId, newReserveCid } } },
+      ], [POOL_OPERATOR]);
+      newPoolCid = extractContractId(upd);
+    }
+  }
+  return { previous: reserve.createArgument, feedId, newReserveCid, newPoolCid, updateId: exResult.transaction?.updateId || exResult.updateId };
+}
+
+/** POST /admin/update-risk-params — exercise AssetReserve.UpdateRiskParams (pool operator).
+ *  Body: { instrumentIdId, ltv, liquidationThreshold, liquidationBonus, isActive?, depositCap?, borrowCap? }.
+ *  priceFeedId is preserved from the current reserve (the DAR forbids changing it here). */
+app.post('/admin/update-risk-params', async (req, res) => {
+  try {
+    const { instrumentIdId, ltv, liquidationThreshold, liquidationBonus, isActive, depositCap, borrowCap } = req.body;
+    if (!instrumentIdId || ltv == null || liquidationThreshold == null || liquidationBonus == null) {
+      return res.status(400).json({ success: false, error: 'instrumentIdId, ltv, liquidationThreshold, liquidationBonus are required' });
+    }
+    // Resolve the current reserve to preserve its (immutable-here) priceFeedId + defaults.
+    const reserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
+    const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
+    if (!reserve) return res.status(404).json({ success: false, error: `No AssetReserve found for ${instrumentIdId}` });
+    const cur = reserve.createArgument.riskParams;
+
+    const newRiskParams = {
+      ltv: String(ltv),
+      liquidationThreshold: String(liquidationThreshold),
+      liquidationBonus: String(liquidationBonus),
+      priceFeedId: cur.priceFeedId,
+      isActive: isActive ?? cur.isActive ?? true,
+      depositCap: depositCap === undefined ? (cur.depositCap ?? null) : (depositCap === null ? null : String(depositCap)),
+      borrowCap: borrowCap === undefined ? (cur.borrowCap ?? null) : (borrowCap === null ? null : String(borrowCap)),
+    };
+
+    const out = await exerciseReserveChoiceAndRepoint(instrumentIdId, 'UpdateRiskParams', { newRiskParams });
+    console.log(`UpdateRiskParams ${instrumentIdId}: ltv ${cur.ltv}->${newRiskParams.ltv}, liqThr ${cur.liquidationThreshold}->${newRiskParams.liquidationThreshold}, reserve=${out.newReserveCid}`);
+    res.json({ success: true, instrumentIdId, previousRiskParams: cur, newRiskParams, ...out });
+  } catch (e) {
+    console.error('UPDATE RISK PARAMS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/update-interest-params — exercise AssetReserve.UpdateInterestRateParams (pool operator).
+ *  Body: { instrumentIdId, optimalUtilization, baseRate, slope1, slope2, reserveFactor, holdingFeeRate? } */
+app.post('/admin/update-interest-params', async (req, res) => {
+  try {
+    const { instrumentIdId, optimalUtilization, baseRate, slope1, slope2, reserveFactor, holdingFeeRate } = req.body;
+    if (!instrumentIdId || optimalUtilization == null || baseRate == null || slope1 == null || slope2 == null || reserveFactor == null) {
+      return res.status(400).json({ success: false, error: 'instrumentIdId + all interest rate fields are required' });
+    }
+    const newInterestRateParams = {
+      optimalUtilization: String(optimalUtilization),
+      baseRate: String(baseRate),
+      slope1: String(slope1),
+      slope2: String(slope2),
+      reserveFactor: String(reserveFactor),
+      holdingFeeRate: String(holdingFeeRate ?? '0.0000000000'),
+    };
+    const out = await exerciseReserveChoiceAndRepoint(instrumentIdId, 'UpdateInterestRateParams', { newInterestRateParams });
+    console.log(`UpdateInterestRateParams ${instrumentIdId}: reserve=${out.newReserveCid}`);
+    res.json({ success: true, instrumentIdId, newInterestRateParams, ...out });
+  } catch (e) {
+    console.error('UPDATE INTEREST PARAMS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/set-pause-flags — exercise LendingPool.SetPauseFlags (pool operator, pool-wide).
+ *  Body: { pauseDeposits, pauseWithdrawals, pauseBorrows, pauseLiquidations } (all Bool). */
+app.post('/admin/set-pause-flags', async (req, res) => {
+  try {
+    const { pauseDeposits = false, pauseWithdrawals = false, pauseBorrows = false, pauseLiquidations = false } = req.body;
+    const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pool = pools[pools.length - 1];
+    if (!pool?.contractId) return res.status(404).json({ success: false, error: 'No active LendingPool found' });
+
+    const result = await submitCommand([
+      {
+        ExerciseCommand: {
+          templateId: POOL_TID,
+          contractId: pool.contractId,
+          choice: 'SetPauseFlags',
+          choiceArgument: {
+            newPauseDeposits: !!pauseDeposits,
+            newPauseWithdrawals: !!pauseWithdrawals,
+            newPauseBorrows: !!pauseBorrows,
+            newPauseLiquidations: !!pauseLiquidations,
+          },
+        },
+      },
+    ], [POOL_OPERATOR]);
+    const newPoolCid = extractContractId(result);
+    console.log(`SetPauseFlags: dep=${!!pauseDeposits} wd=${!!pauseWithdrawals} bor=${!!pauseBorrows} liq=${!!pauseLiquidations}, pool=${newPoolCid}`);
+    res.json({
+      success: true,
+      pauseFlags: { pauseDeposits: !!pauseDeposits, pauseWithdrawals: !!pauseWithdrawals, pauseBorrows: !!pauseBorrows, pauseLiquidations: !!pauseLiquidations },
+      newPoolCid,
+      updateId: result.transaction?.updateId || result.updateId,
+    });
+  } catch (e) {
+    console.error('SET PAUSE FLAGS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** GET /admin/liquidatable — scan every UserPosition, compute HF off-chain, and return the
+ *  ones with HF < 1 along with the borrower's private-position blobs (the operator-mediated
+ *  disclosure a liquidator needs to see them). HF here is approximate — the DAR re-verifies
+ *  HF<1 on-chain at liquidation time; this only surfaces candidates. */
+app.get('/admin/liquidatable', async (req, res) => {
+  try {
+    const P = `#alpend-lending-final-loop:Lending.`;
+    const [poolC, reserveC, userPosC, depositC, borrowC, oracleC] = await Promise.all([
+      queryContracts(`${P}Pool:LendingPool`, POOL_OPERATOR),
+      queryContracts(`${P}AssetReserve:AssetReserve`, POOL_OPERATOR),
+      queryContracts(`${P}UserPosition:UserPosition`, POOL_OPERATOR),
+      queryContracts(`${P}Deposit:DepositPosition`, POOL_OPERATOR),
+      queryContracts(`${P}Borrow:BorrowPosition`, POOL_OPERATOR),
+      queryContracts(`${P}Oracle:PriceOracle`, POOL_OPERATOR),
+    ]);
+
+    const pool = poolC[poolC.length - 1];
+    const oracle = oracleC[oracleC.length - 1];
+    const prices = oracle?.createArgument?.prices || {}; // TextMap feedId -> PriceData
+
+    // Per-instrument reserve info (current CID + blob + risk params + indices + price).
+    const byInstrument = {};
+    for (const r of reserveC) {
+      const a = r.createArgument || {};
+      const id = a.instrumentId?.id;
+      if (!id) continue;
+      const feed = a.riskParams?.priceFeedId;
+      byInstrument[id] = {
+        reserveCid: r.contractId,
+        blob: r.createdEventBlob,
+        templateId: r.templateId,
+        instrumentId: a.instrumentId,
+        price: parseFloat(prices[feed]?.price || '0'),
+        ltv: parseFloat(a.riskParams?.ltv || '0'),
+        liqThreshold: parseFloat(a.riskParams?.liquidationThreshold || '0'),
+        liquidationBonus: parseFloat(a.riskParams?.liquidationBonus || '0'),
+        liquidityIndex: parseFloat(a.liquidityIndex || '1'),
+        variableBorrowIndex: parseFloat(a.variableBorrowIndex || '1'),
+        totalLiquidity: parseFloat(a.totalLiquidity || '0'),
+      };
+    }
+
+    const depByCid = {}, borByCid = {};
+    for (const d of depositC) depByCid[d.contractId] = d;
+    for (const b of borrowC) borByCid[b.contractId] = b;
+
+    const candidates = [];
+    for (const up of userPosC) {
+      const a = up.createArgument || {};
+      let liqThreshUSD = 0, borrowedUSD = 0, collateralUSD = 0;
+
+      const collaterals = [];
+      for (const cid of (a.supplyPositionCids || [])) {
+        const d = depByCid[cid]; if (!d) continue;
+        const da = d.createArgument || {};
+        const info = byInstrument[da.instrumentId?.id]; if (!info) continue;
+        const entryIdx = parseFloat(da.liquidityIndex || '1');
+        const accrued = parseFloat(da.principal || '0') * (entryIdx > 0 ? info.liquidityIndex / entryIdx : 1);
+        const valueUSD = accrued * info.price;
+        collateralUSD += valueUSD;
+        if (da.isUsedAsCollateral) liqThreshUSD += valueUSD * info.liqThreshold;
+        collaterals.push({
+          cid, blob: d.createdEventBlob, templateId: d.templateId,
+          instrumentId: da.instrumentId, reserveCid: info.reserveCid,
+          reserveBlob: info.blob, reserveTemplateId: info.templateId,
+          amount: accrued, valueUSD, isUsedAsCollateral: !!da.isUsedAsCollateral,
+          liquidationBonus: info.liquidationBonus, price: info.price,
+          totalLiquidity: info.totalLiquidity,
+        });
+      }
+
+      const borrows = [];
+      for (const cid of (a.borrowPositionCids || [])) {
+        const b = borByCid[cid]; if (!b) continue;
+        const ba = b.createArgument || {};
+        const info = byInstrument[ba.instrumentId?.id]; if (!info) continue;
+        const entryIdx = parseFloat(ba.borrowIndex || '1');
+        const accrued = parseFloat(ba.borrowedAmount || '0') * (entryIdx > 0 ? info.variableBorrowIndex / entryIdx : 1);
+        const valueUSD = accrued * info.price;
+        borrowedUSD += valueUSD;
+        borrows.push({
+          cid, blob: b.createdEventBlob, templateId: b.templateId,
+          instrumentId: ba.instrumentId, reserveCid: info.reserveCid,
+          reserveBlob: info.blob, reserveTemplateId: info.templateId,
+          amount: accrued, valueUSD, price: info.price,
+        });
+      }
+
+      const hf = borrowedUSD > 0 ? liqThreshUSD / borrowedUSD : Infinity;
+      if (borrowedUSD > 0 && hf < 1.0) {
+        candidates.push({
+          borrower: a.user,
+          userPositionCid: up.contractId,
+          userPositionBlob: up.createdEventBlob,
+          userPositionTemplateId: up.templateId,
+          hf: Number.isFinite(hf) ? Number(hf.toFixed(4)) : null,
+          collateralUSD: Number(collateralUSD.toFixed(2)),
+          borrowedUSD: Number(borrowedUSD.toFixed(2)),
+          borrows,
+          collaterals,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      poolCid: pool?.contractId,
+      poolBlob: pool?.createdEventBlob,
+      poolTemplateId: pool?.templateId,
+      oracleCid: oracle?.contractId,
+      oracleBlob: oracle?.createdEventBlob,
+      oracleTemplateId: oracle?.templateId,
+      candidates,
+    });
+  } catch (e) {
+    console.error('LIQUIDATABLE error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });

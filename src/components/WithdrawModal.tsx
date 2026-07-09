@@ -4,7 +4,8 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildWithdrawTSWithPositionCommand } from '../commands/withdraw';
 import { ASSETS, type AssetKey } from '../assets';
-import { fetchPoolHoldings, poolCidFromDisclosed } from '../utils/transferContext';
+import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { HealthFactorPreview } from './HealthFactorPreview';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { POOL_OPERATOR } from '../config';
 
@@ -40,12 +41,40 @@ export function WithdrawModal({
   const selectedDeposit = cfg.depositPosition(position);
   const depositPrincipal = selectedDeposit ? parseFloat(selectedDeposit.principal) : 0;
 
+  // Max SAFE withdrawal — keeps HF >= 1 (mirrors the DAR's auto-max: excess weighted
+  // collateral / this asset's ltv / price), capped at the deposit principal. With no debt
+  // the whole deposit is withdrawable. Post-withdraw HF drops as collateral leaves.
+  const info = position.assetInfo[cfg.instrumentId] || { price: 0, ltv: 0, liqThreshold: 0 };
+  const borrowedUSD = parseFloat(position.totalBorrowed);
+  const liqThreshUSD = parseFloat(position.totalLiqThresholdCollateralUSD);
+  const weightedUSD = parseFloat(position.totalWeightedCollateralUSD);
+  const maxSafeWithdraw = borrowedUSD > 0 && info.ltv > 0 && info.price > 0
+    ? Math.max(0, Math.min(depositPrincipal, (weightedUSD - borrowedUSD) / info.ltv / info.price))
+    : depositPrincipal;
+  const effectiveWithdraw = fullWithdraw
+    ? (borrowedUSD > 0 ? Math.min(supplied, maxSafeWithdraw) : supplied)
+    : parseFloat(amount) || 0;
+  const currentHF = borrowedUSD > 0.01 ? liqThreshUSD / borrowedUSD : null;
+  const projectedHF = borrowedUSD > 0.01
+    ? Math.max(0, liqThreshUSD - effectiveWithdraw * info.price * info.liqThreshold) / borrowedUSD
+    : null;
+
   const handleSubmit = async () => {
     if (!fullWithdraw && (!amount || parseFloat(amount) <= 0)) return;
     setSubmitting(true);
     setError('');
 
     try {
+      // Re-resolve the current reserve / user-position / deposit CIDs — the cached
+      // `position` copy can be stale (reserve CIDs churn on every accrue/action).
+      const live = await fetchLiveCids(partyId);
+      const reserveCid = live.reservesByInstrument[cfg.instrumentId] || cfg.reserveCid(position);
+      const userPositionCid = live.userPositionCid || position.userPositionCid;
+      const depositPositionCid = live.depositsByInstrument[cfg.instrumentId] || selectedDeposit?.cid || '';
+      const accountReserveCids = Object.entries(live.reservesByInstrument)
+        .filter(([id]) => id !== cfg.instrumentId)
+        .map(([, cid]) => cid);
+
       // Withdraw is a pool-as-sender payout: pull the pool operator's current
       // holdings of this asset (they double as transfer inputs + disclosures, and
       // as freshReserveHoldingCids for ephemeral assets).
@@ -76,15 +105,15 @@ export function WithdrawModal({
 
       const cmd = buildWithdrawTSWithPositionCommand(
         {
-          poolCid: poolCidFromDisclosed(effectiveDisclosed, position.poolCid),
+          poolCid: poolCidFromDisclosed(effectiveDisclosed, live.poolCid || position.poolCid),
           supplier: partyId,
-          depositPositionCid: selectedDeposit?.cid || '',
-          assetReserveCid: cfg.reserveCid(position),
+          depositPositionCid,
+          assetReserveCid: reserveCid,
           transferFactoryCid: ctx.transferFactoryCid,
-          userPositionCid: position.userPositionCid,
+          userPositionCid,
           // Other reserves backing the user's collateral so the DAR's on-chain HF
           // counts the full basket.
-          accountReserveCids: cfg.otherReserveCids(position),
+          accountReserveCids,
           // Ephemeral assets (CC) must pass fresh pool holdings covering full
           // reserve liquidity (FIND-025); stable assets (USDCx) use stored holdings.
           freshReserveHoldingCids: cfg.isEphemeral ? poolHoldings.cids : null,
@@ -122,6 +151,13 @@ export function WithdrawModal({
         <div className="modal-balance">{supplied.toFixed(4)} {cfg.symbol}</div>
       </div>
 
+      {borrowedUSD > 0.01 && (
+        <div className="modal-field">
+          <label className="modal-label">Max Safe Withdrawal (keeps HF ≥ 1)</label>
+          <div className="modal-balance-sm">{maxSafeWithdraw.toFixed(4)} {cfg.symbol}</div>
+        </div>
+      )}
+
       <div className="modal-field">
         <label className="modal-checkbox-label">
           <input
@@ -146,12 +182,16 @@ export function WithdrawModal({
             />
             <button
               className="btn-max"
-              onClick={() => setAmount(depositPrincipal.toFixed(10))}
+              onClick={() => setAmount(maxSafeWithdraw.toFixed(10))}
             >
               MAX
             </button>
           </div>
         </div>
+      )}
+
+      {borrowedUSD > 0.01 && (
+        <HealthFactorPreview current={currentHF} projected={projectedHF} showProjected={effectiveWithdraw > 0} />
       )}
 
       {error && <div className="modal-error">{error}</div>}

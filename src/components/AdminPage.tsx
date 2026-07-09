@@ -1,4 +1,9 @@
 import type { LoopProvider, TransactionPayload } from '../loop/provider';
+import { useAdminData } from '../hooks/useAdminData';
+import { AdminOverview } from './admin/AdminOverview';
+import { ManageAssets } from './admin/ManageAssets';
+import { PauseControls } from './admin/PauseControls';
+import { CollapsibleSection } from './admin/CollapsibleSection';
 import { PoolSetup } from './PoolSetup';
 import { ContractExplorer } from './ContractExplorer';
 
@@ -18,22 +23,35 @@ interface Props {
   ) => void;
 }
 
-export function AdminPage({
-  partyId,
-  provider,
-  submitTx,
-  addLog,
-}: Props) {
+export function AdminPage({ partyId, provider, submitTx, addLog }: Props) {
+  const data = useAdminData();
+
   return (
     <div className="admin-page">
       <div className="admin-header">
-        <h2>Admin Panel</h2>
+        <h2>Admin</h2>
         <p className="muted">
-          Pool operator tools for managing the lending protocol.
+          Pool operator tools. The top sections are for everyday use; setup and debug are tucked
+          away below.
         </p>
       </div>
-      <PoolSetup partyId={partyId} submitTx={submitTx} addLog={addLog} />
-      <ContractExplorer provider={provider} partyId={partyId} />
+
+      <AdminOverview data={data} />
+      <ManageAssets data={data} />
+      <PauseControls data={data} />
+
+      <CollapsibleSection
+        title="Initial Setup"
+        subtitle="one-time bootstrap — you normally never touch these"
+        icon="⚠"
+        tone="warn"
+      >
+        <PoolSetup partyId={partyId} submitTx={submitTx} addLog={addLog} />
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Contract Explorer" subtitle="raw on-ledger contracts (debug)" icon="🔍">
+        <ContractExplorer provider={provider} partyId={partyId} />
+      </CollapsibleSection>
     </div>
   );
 }

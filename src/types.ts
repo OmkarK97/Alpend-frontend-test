@@ -67,6 +67,8 @@ export interface PositionData {
   totalWeightedCollateralUSD: string;
   totalLiqThresholdCollateralUSD: string;
   healthFactor: string | null;
+  /** Per-instrument-id price + risk params, for post-action HF projections. */
+  assetInfo: Record<string, { price: number; ltv: number; liqThreshold: number }>;
   walletBalance: string;
   ccWalletBalance: string;
 
