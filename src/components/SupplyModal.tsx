@@ -3,7 +3,7 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildSupplyTSWithPositionCommand } from '../commands/deposit';
-import { poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { poolCidFromDisclosed, fetchLiveCids, withEphemeralRetry } from '../utils/transferContext';
 import { HealthFactorPreview } from './HealthFactorPreview';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
@@ -49,8 +49,13 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
     setSubmitting(true);
     setError('');
 
-    try {
-      const holdingCids = holdings.map((h) => h.contractId);
+    // Assemble + submit. Re-fetches the wallet's holdings via Loop each call so an
+    // ephemeral-CC retry uses the CURRENT holding CIDs (CC re-issues on round boundaries,
+    // including during wallet-signing latency → stale CID → CONTRACT_NOT_FOUND).
+    const doSupply = async () => {
+      const fresh = await position.getFreshHoldings();
+      const freshList = fresh ? (cfg.isEphemeral ? fresh.cc : fresh.usdcx) : holdings;
+      const holdingCids = freshList.map((h) => h.contractId);
 
       const missingCids: string[] = [];
       if (!position.poolCid) missingCids.push('poolCid');
@@ -98,9 +103,13 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
         effectiveDisclosed
       );
 
-      const result = await submitTx('SupplyTSWithPosition', cmd, `Supply ${amount} ${cfg.symbol}`, {
+      return submitTx('SupplyTSWithPosition', cmd, `Supply ${amount} ${cfg.symbol}`, {
         estimateTraffic: false,
       });
+    };
+
+    try {
+      const result = await withEphemeralRetry(cfg.isEphemeral, doSupply);
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;

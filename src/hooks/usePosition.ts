@@ -43,8 +43,11 @@ export function usePosition(
   const [hasUserPosition, setHasUserPosition] = useState(false);
   const fetched = useRef(false);
 
-  const fetchHoldings = useCallback(async () => {
-    if (!provider) return;
+  const fetchHoldings = useCallback(async (): Promise<{
+    usdcx: { contractId: string; amount: string; owner: string }[];
+    cc: { contractId: string; amount: string; owner: string }[];
+  } | null> => {
+    if (!provider) return null;
 
     // Parsed holding with metadata for splitting into USDCx vs CC
     type ParsedHolding = {
@@ -144,15 +147,15 @@ export function usePosition(
         )
         .map((h) => ({ contractId: h.contractId, amount: h.amount, owner: h.owner }));
 
-      if (usdcx.length > 0) {
-        setUsdcxHoldings(usdcx);
-        setWalletBalance(usdcx.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
-      }
-      if (cc.length > 0) {
-        setCcHoldings(cc);
-        setCcWalletBalance(cc.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
-      }
+      // Set UNCONDITIONALLY. Guarding on length > 0 kept a stale list when a fetch caught
+      // an ephemeral CC holding mid-re-issue (old CID archived, new one not yet indexed) —
+      // exactly the CONTRACT_NOT_FOUND source on CC supply. Reflect reality, including empty.
+      setUsdcxHoldings(usdcx);
+      setWalletBalance(usdcx.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
+      setCcHoldings(cc);
+      setCcWalletBalance(cc.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
       console.log('Holdings split: USDCx:', usdcx.length, 'CC:', cc.length);
+      return { usdcx, cc };
     };
 
     // Strategy 1: Try getActiveContracts with interface ID (# prefix format from SDK docs)
@@ -166,8 +169,7 @@ export function usePosition(
         const allHoldings = parseAllHoldings(loopResult as unknown[]);
         if (allHoldings.length > 0) {
           console.log('Strategy 1: got', allHoldings.length, 'total holdings via interfaceId', iid);
-          setHoldingsFromParsed(allHoldings);
-          return;
+          return setHoldingsFromParsed(allHoldings);
         }
       } catch {
         console.warn('Strategy 1 failed for interfaceId:', iid);
@@ -185,8 +187,7 @@ export function usePosition(
         const allHoldings = parseAllHoldings(loopResult as unknown[]);
         if (allHoldings.length > 0) {
           console.log('Strategy 2: got', allHoldings.length, 'total holdings via templateId', tid);
-          setHoldingsFromParsed(allHoldings);
-          return;
+          return setHoldingsFromParsed(allHoldings);
         }
       } catch {
         console.warn('Strategy 2 failed for templateId:', tid);
@@ -256,7 +257,7 @@ export function usePosition(
           setUsdcxHoldings(cidsHoldings);
           setWalletBalance(total.toFixed(10));
           console.log('Strategy 3: got', allCids.length, 'holding CIDs');
-          return;
+          return { usdcx: cidsHoldings.map((h) => ({ contractId: h.contractId, amount: h.amount, owner: partyId })), cc: [] };
         }
 
         // Got balance but no CIDs — show balance but holdings can't be used for tx
@@ -267,6 +268,7 @@ export function usePosition(
     } catch {
       console.warn('Strategy 3 (getHolding) also failed');
     }
+    return null;
   }, [provider, partyId]);
 
   const initialLoadDone = useRef(false);
@@ -335,7 +337,9 @@ export function usePosition(
           : null;
       if (latestCcReserve) setCcAssetReserveCid(latestCcReserve.contractId);
 
-      // User position
+      // User position — ONLY this party's. Never fall back to another user's UserPosition
+      // when this party has none, or a new user looks initialized and supply fails on-chain
+      // with "UserPosition does not belong to this user".
       const userPosFiltered =
         userPosResp.contracts?.filter(
           (c: { createArgument?: { user?: string } }) =>
@@ -344,7 +348,7 @@ export function usePosition(
       const latestUserPos =
         userPosFiltered.length > 0
           ? userPosFiltered[userPosFiltered.length - 1]
-          : userPosResp.contracts?.[userPosResp.contracts?.length - 1];
+          : undefined;
 
       if (latestUserPos) {
         setUserPositionCid(latestUserPos.contractId);
@@ -542,5 +546,6 @@ export function usePosition(
     error,
     hasUserPosition,
     refresh,
+    getFreshHoldings: fetchHoldings,
   };
 }

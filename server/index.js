@@ -1178,8 +1178,12 @@ app.get('/query/user-position/:party', async (req, res) => {
     const templateId = `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`;
     // Query as pool operator (observer on UserPosition), then filter by party
     const contracts = await queryContracts(templateId, POOL_OPERATOR);
+    // Return ONLY this party's UserPosition(s). NEVER fall back to all contracts when the
+    // party has none — a brand-new user would otherwise receive a stranger's UserPosition,
+    // which makes the client think they're initialized and then fails on-chain with
+    // "UserPosition does not belong to this user".
     const filtered = contracts.filter(c => c.createArgument?.user === req.params.party);
-    res.json({ success: true, contracts: filtered.length > 0 ? filtered : contracts });
+    res.json({ success: true, contracts: filtered });
   } catch (e) {
     console.error('QUERY USER POSITION error:', e.message);
     res.status(500).json({ success: false, error: e.message });

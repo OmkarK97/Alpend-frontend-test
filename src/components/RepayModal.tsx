@@ -3,7 +3,7 @@ import { ActionModal } from './ActionModal';
 import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildRepayTSWithPositionCommand } from '../commands/repay';
-import { poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { poolCidFromDisclosed, fetchLiveCids, withEphemeralRetry } from '../utils/transferContext';
 import { HealthFactorPreview } from './HealthFactorPreview';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
@@ -49,8 +49,12 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
     setSubmitting(true);
     setError('');
 
-    try {
-      const holdingCids = holdings.map((h) => h.contractId);
+    // Re-fetches wallet holdings each call so an ephemeral-CC retry uses current holding CIDs
+    // (CC re-issues on round boundaries / during wallet-signing → stale CID → CONTRACT_NOT_FOUND).
+    const doRepay = async () => {
+      const fresh = await position.getFreshHoldings();
+      const freshList = fresh ? (cfg.isEphemeral ? fresh.cc : fresh.usdcx) : holdings;
+      const holdingCids = freshList.map((h) => h.contractId);
 
       const ctx = await cfg.fetchUserSendContext(
         partyId,
@@ -85,12 +89,16 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
         effectiveDisclosed
       );
 
-      const result = await submitTx(
+      return submitTx(
         'RepayTSWithPosition',
         cmd,
         fullRepay ? `Full ${cfg.symbol} repayment` : `Repay ${amount} ${cfg.symbol}`,
         { estimateTraffic: false }
       );
+    };
+
+    try {
+      const result = await withEphemeralRetry(cfg.isEphemeral, doRepay);
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;

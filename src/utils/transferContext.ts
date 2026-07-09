@@ -10,6 +10,26 @@ export interface TransferContext {
   disclosedContracts: DisclosedContract[];
 }
 
+/** True if the error is a ledger CONTRACT_NOT_FOUND (archived/stale contract). */
+export function isContractNotFound(e: unknown): boolean {
+  const s = typeof e === 'string' ? e : (e as { message?: string })?.message || JSON.stringify(e ?? '');
+  return /CONTRACT_NOT_FOUND/i.test(s);
+}
+
+/** Run `fn`; if it fails with CONTRACT_NOT_FOUND on an ephemeral asset (Canton Coin holdings
+ *  re-issue on round boundaries, including during wallet-signing latency), rebuild + retry ONCE.
+ *  `fn` must itself re-fetch fresh holdings each call so the retry uses the current CIDs. */
+export async function withEphemeralRetry<T>(ephemeral: boolean, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (ephemeral && isContractNotFound(e)) {
+      return await fn();
+    }
+    throw e;
+  }
+}
+
 /**
  * Live contract CIDs for a party, fetched fresh at submit time. `position` (from usePosition)
  * is only as fresh as its last refresh, but reserve CIDs churn on every accrue/action by ANY
@@ -37,8 +57,9 @@ export async function fetchLiveCids(partyId: string): Promise<LiveCids> {
   const poolC: C[] = poolResp.contracts || [];
   const poolCid = poolC[poolC.length - 1]?.contractId || '';
 
+  // ONLY this party's UserPosition — never fall back to another user's (see usePosition).
   const upC: C[] = (upResp.contracts || []).filter((c: C) => c.createArgument?.user === partyId);
-  const userPositionCid = (upC[upC.length - 1] || (upResp.contracts || [])[(upResp.contracts || []).length - 1])?.contractId || '';
+  const userPositionCid = upC[upC.length - 1]?.contractId || '';
 
   const reservesByInstrument: Record<string, string> = {};
   for (const c of (arResp.contracts || []) as C[]) {

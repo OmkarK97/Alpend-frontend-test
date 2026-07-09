@@ -82,4 +82,10 @@ export interface PositionData {
   error: string | null;
   hasUserPosition: boolean;
   refresh: () => Promise<void>;
+  /** Re-fetch the wallet's holdings via Loop (fresh CIDs) — used at submit time on the
+   *  ephemeral CC path to avoid stale-holding CONTRACT_NOT_FOUND. */
+  getFreshHoldings: () => Promise<{
+    usdcx: { contractId: string; amount: string; owner: string }[];
+    cc: { contractId: string; amount: string; owner: string }[];
+  } | null>;
 }
