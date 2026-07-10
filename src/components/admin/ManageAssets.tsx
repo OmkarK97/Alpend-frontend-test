@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { ADMIN_API_URL } from '../../config';
 import type { AdminAsset, AdminData } from '../../hooks/useAdminData';
-import { fmtUsd, fmtPercent, decimalToPctInput, pctInputToDecimal } from '../../utils/format';
+import { fmtUsd, fmtPercent, fmtDecimal, decimalToPctInput, pctInputToDecimal } from '../../utils/format';
 
 async function postAdmin(path: string, body: Record<string, unknown>) {
   const resp = await fetch(`${ADMIN_API_URL}${path}`, {
@@ -77,6 +77,8 @@ function RiskParamsCard({ asset, onDone }: { asset: AdminAsset; onDone: () => vo
   const [thr, setThr] = useState(decimalToPctInput(asset.risk.liquidationThreshold));
   const [bonus, setBonus] = useState(decimalToPctInput(asset.risk.liquidationBonus));
   const [active, setActive] = useState(asset.risk.isActive);
+  const [depositCap, setDepositCap] = useState(asset.risk.depositCap ?? '');
+  const [borrowCap, setBorrowCap] = useState(asset.risk.borrowCap ?? '');
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
   const [busy, setBusy] = useState(false);
 
@@ -97,6 +99,9 @@ function RiskParamsCard({ asset, onDone }: { asset: AdminAsset; onDone: () => vo
       liquidationThreshold: pctInputToDecimal(thr),
       liquidationBonus: pctInputToDecimal(bonus),
       isActive: active,
+      // blank = unlimited (null clears the cap); a value sets it
+      depositCap: depositCap.trim() === '' ? null : depositCap.trim(),
+      borrowCap: borrowCap.trim() === '' ? null : borrowCap.trim(),
     });
     setBusy(false);
     if (r.success) { setStatus({ kind: 'ok', msg: `Updated. New reserve ${String(r.newReserveCid).slice(0, 20)}…` }); onDone(); }
@@ -114,6 +119,10 @@ function RiskParamsCard({ asset, onDone }: { asset: AdminAsset; onDone: () => vo
         <Field label="Loan-to-value (LTV)" hint="max borrow per $1 of collateral" value={ltv} onChange={setLtv} current={fmtPercent(asset.risk.ltv)} suffix="%" />
         <Field label="Liquidation threshold" hint="health factor hits 1 here" value={thr} onChange={setThr} current={fmtPercent(asset.risk.liquidationThreshold)} suffix="%" />
         <Field label="Liquidation bonus" hint="discount a liquidator earns" value={bonus} onChange={setBonus} current={fmtPercent(asset.risk.liquidationBonus)} suffix="%" />
+      </div>
+      <div className="admin-field-grid">
+        <Field label="Deposit cap" hint="max total supplied · blank = unlimited" value={depositCap} onChange={setDepositCap} current={asset.risk.depositCap ? fmtDecimal(asset.risk.depositCap) : 'unlimited'} suffix={asset.symbol} />
+        <Field label="Borrow cap" hint="max total borrowed · blank = unlimited" value={borrowCap} onChange={setBorrowCap} current={asset.risk.borrowCap ? fmtDecimal(asset.risk.borrowCap) : 'unlimited'} suffix={asset.symbol} />
       </div>
       <label className="admin-checkbox">
         <input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />
@@ -209,6 +218,35 @@ function RefreshHoldingsCard({ asset, onDone }: { asset: AdminAsset; onDone: () 
   );
 }
 
+/* ---- Accrue Interest ---------------------------------------------------- */
+function AccrueInterestCard({ asset, onDone }: { asset: AdminAsset; onDone: () => void }) {
+  const [status, setStatus] = useState<Status>({ kind: 'idle' });
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setBusy(true); setStatus({ kind: 'idle' });
+    const r = await postAdmin('/admin/accrue-interest', { instrumentIdId: asset.instrumentId });
+    setBusy(false);
+    if (r.success) { setStatus({ kind: 'ok', msg: 'Interest accrued (indices advanced to now)' }); onDone(); }
+    else setStatus({ kind: 'err', msg: r.error || 'Failed' });
+  };
+
+  return (
+    <div className="admin-card">
+      <h4 className="admin-card-title">Accrue interest</h4>
+      <p className="admin-card-desc">
+        Advances {asset.symbol}'s compound indices to now, so earned/owed interest since the last
+        touch is realized. Normally happens automatically on any action — use this to force it (e.g.
+        for testing on an idle pool).
+      </p>
+      <button className="btn btn-primary btn-sm" onClick={submit} disabled={busy}>
+        {busy ? 'Accruing…' : `Accrue ${asset.symbol} Interest`}
+      </button>
+      <StatusLine status={status} />
+    </div>
+  );
+}
+
 /* ---- Section ------------------------------------------------------------ */
 export function ManageAssets({ data }: { data: AdminData }) {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -243,6 +281,7 @@ export function ManageAssets({ data }: { data: AdminData }) {
           <SetPriceCard asset={asset} onDone={data.refresh} />
           <RiskParamsCard asset={asset} onDone={data.refresh} />
           <InterestRatesCard asset={asset} onDone={data.refresh} />
+          <AccrueInterestCard asset={asset} onDone={data.refresh} />
           <RefreshHoldingsCard asset={asset} onDone={data.refresh} />
         </div>
       )}

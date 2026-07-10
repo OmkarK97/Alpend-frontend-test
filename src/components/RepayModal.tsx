@@ -4,6 +4,7 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildRepayTSWithPositionCommand } from '../commands/repay';
 import { poolCidFromDisclosed, fetchLiveCids, withEphemeralRetry } from '../utils/transferContext';
+import { fmtBalance } from '../utils/format';
 import { HealthFactorPreview } from './HealthFactorPreview';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
@@ -116,12 +117,12 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
     <ActionModal title={`Repay ${cfg.symbol}`} onClose={onClose} successMessage={successMessage} updateId={updateId}>
       <div className="modal-field">
         <label className="modal-label">Outstanding Debt</label>
-        <div className="modal-balance">{borrowed.toFixed(4)} {cfg.symbol}</div>
+        <div className="modal-balance">{fmtBalance(borrowed)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">
         <label className="modal-label">Wallet Balance</label>
-        <div className="modal-balance-sm">{walletBal.toFixed(4)} {cfg.symbol}</div>
+        <div className="modal-balance-sm">{fmtBalance(walletBal)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">

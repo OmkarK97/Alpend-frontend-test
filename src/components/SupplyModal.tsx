@@ -4,6 +4,7 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildSupplyTSWithPositionCommand } from '../commands/deposit';
 import { poolCidFromDisclosed, fetchLiveCids, withEphemeralRetry } from '../utils/transferContext';
+import { fmtBalance } from '../utils/format';
 import { HealthFactorPreview } from './HealthFactorPreview';
 import { ASSETS, type AssetKey } from '../assets';
 import type { SubmitTxOptions } from '../hooks/useLoop';
@@ -127,7 +128,7 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
     <ActionModal title={`Supply ${cfg.symbol}`} onClose={onClose} successMessage={successMessage} updateId={updateId}>
       <div className="modal-field">
         <label className="modal-label">Available Balance</label>
-        <div className="modal-balance">{parseFloat(maxAmount).toFixed(4)} {cfg.symbol}</div>
+        <div className="modal-balance">{fmtBalance(maxAmount)} {cfg.symbol}</div>
       </div>
 
       <div className="modal-field">

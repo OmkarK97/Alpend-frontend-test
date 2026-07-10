@@ -430,15 +430,42 @@ export function usePosition(
       const isCC = (d: { instrumentId: { admin: string; id: string } }) =>
         d.instrumentId.id === 'Amulet' || d.instrumentId.admin?.startsWith('DSO::');
 
+      // Surface ACCRUED value, not raw principal (principal alone hides earned/owed interest).
+      // Accrued deposit = principal * (reserve.liquidityIndex / entryLiquidityIndex);
+      // accrued borrow  = principal * (reserve.variableBorrowIndex / entryBorrowIndex).
+      // NB: the STORED reserve index only advances when the reserve is touched (AccrueInterest
+      // or any action), so accrual becomes visible once the index moves.
+      const reserveIndexById: Record<string, { liq: number; borrow: number }> = {};
+      for (const c of (reserveResp.contracts || []) as Array<{
+        createArgument?: { instrumentId?: { id?: string }; liquidityIndex?: string; variableBorrowIndex?: string };
+      }>) {
+        const a = c.createArgument;
+        const id = a?.instrumentId?.id;
+        if (id) reserveIndexById[id] = {
+          liq: parseFloat(a?.liquidityIndex || '1') || 1,
+          borrow: parseFloat(a?.variableBorrowIndex || '1') || 1,
+        };
+      }
+      const depositAccrued = (d: DepositPosition) => {
+        const idx = reserveIndexById[d.instrumentId.id];
+        const entry = parseFloat(d.liquidityIndex || '1') || 1;
+        return parseFloat(d.principal) * (idx ? idx.liq / entry : 1);
+      };
+      const borrowAccrued = (b: BorrowPosition) => {
+        const idx = reserveIndexById[b.instrumentId.id];
+        const entry = parseFloat(b.borrowIndex || '1') || 1;
+        return parseFloat(b.principal) * (idx ? idx.borrow / entry : 1);
+      };
+
       const usdcxDeps = deposits.filter((d) => !isCC(d));
       const ccDeps = deposits.filter((d) => isCC(d));
       const usdcxBors = borrows.filter((b) => !isCC(b));
       const ccBors = borrows.filter((b) => isCC(b));
 
-      setUsdcxSupplied(usdcxDeps.reduce((s, d) => s + parseFloat(d.principal), 0).toFixed(10));
-      setCcSupplied(ccDeps.reduce((s, d) => s + parseFloat(d.principal), 0).toFixed(10));
-      setUsdcxBorrowed(usdcxBors.reduce((s, b) => s + parseFloat(b.principal), 0).toFixed(10));
-      setCcBorrowed(ccBors.reduce((s, b) => s + parseFloat(b.principal), 0).toFixed(10));
+      setUsdcxSupplied(usdcxDeps.reduce((s, d) => s + depositAccrued(d), 0).toFixed(10));
+      setCcSupplied(ccDeps.reduce((s, d) => s + depositAccrued(d), 0).toFixed(10));
+      setUsdcxBorrowed(usdcxBors.reduce((s, b) => s + borrowAccrued(b), 0).toFixed(10));
+      setCcBorrowed(ccBors.reduce((s, b) => s + borrowAccrued(b), 0).toFixed(10));
 
       // USD aggregates — the post-audit DAR no longer caches these on UserPosition, so
       // compute them here from positions × live oracle prices × per-asset risk params.
@@ -470,7 +497,7 @@ export function usePosition(
       let liqThreshUSD = 0;
       for (const d of deposits) {
         const info = assetInfo[d.instrumentId.id] || { price: 0, ltv: 0, liqThreshold: 0 };
-        const valueUSD = parseFloat(d.principal) * info.price;
+        const valueUSD = depositAccrued(d) * info.price;
         suppliedUSD += valueUSD;
         if (d.isUsedAsCollateral) {
           collateralUSD += valueUSD;
@@ -480,7 +507,7 @@ export function usePosition(
       }
       let borrowedUSD = 0;
       for (const b of borrows) {
-        borrowedUSD += parseFloat(b.principal) * (assetInfo[b.instrumentId.id]?.price || 0);
+        borrowedUSD += borrowAccrued(b) * (assetInfo[b.instrumentId.id]?.price || 0);
       }
 
       setTotalSupplied(suppliedUSD.toFixed(2));

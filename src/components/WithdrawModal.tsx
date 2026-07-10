@@ -5,6 +5,7 @@ import type { PositionData } from '../types';
 import { buildWithdrawTSWithPositionCommand } from '../commands/withdraw';
 import { ASSETS, type AssetKey } from '../assets';
 import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { fmtBalance } from '../utils/format';
 import { HealthFactorPreview } from './HealthFactorPreview';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { POOL_OPERATOR } from '../config';
@@ -148,13 +149,13 @@ export function WithdrawModal({
     <ActionModal title={`Withdraw ${cfg.symbol}`} onClose={onClose} successMessage={successMessage} updateId={updateId}>
       <div className="modal-field">
         <label className="modal-label">Currently Supplied</label>
-        <div className="modal-balance">{supplied.toFixed(4)} {cfg.symbol}</div>
+        <div className="modal-balance">{fmtBalance(supplied)} {cfg.symbol}</div>
       </div>
 
       {borrowedUSD > 0.01 && (
         <div className="modal-field">
           <label className="modal-label">Max Safe Withdrawal (keeps HF ≥ 1)</label>
-          <div className="modal-balance-sm">{maxSafeWithdraw.toFixed(4)} {cfg.symbol}</div>
+          <div className="modal-balance-sm">{fmtBalance(maxSafeWithdraw)} {cfg.symbol}</div>
         </div>
       )}
 

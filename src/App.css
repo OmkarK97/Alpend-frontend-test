@@ -1880,3 +1880,19 @@ details summary {
   pointer-events: none;
 }
 .admin-cell-pct { color: #8b949e; font-size: 0.74rem; }
+
+/* Collateral toggle on supply positions */
+.position-collateral { display: flex; align-items: center; gap: 10px; }
+.btn-collateral-toggle {
+  padding: 4px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.04);
+  color: #c9d1d9;
+  font-size: 0.75rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-collateral-toggle:hover:not(:disabled) { background: rgba(255,255,255,0.09); }
+.btn-collateral-toggle:disabled { opacity: 0.5; cursor: not-allowed; }

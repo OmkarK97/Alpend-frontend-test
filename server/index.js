@@ -1036,6 +1036,31 @@ app.post('/admin/set-pause-flags', async (req, res) => {
   }
 });
 
+/** POST /admin/accrue-interest — force AssetReserve.AccrueInterest, advancing the compound
+ *  indices (liquidityIndex / variableBorrowIndex) to `now`. Accrual normally happens inline on
+ *  every user action; this lets us advance indices on demand (testing / idle-pool freshness)
+ *  without moving funds. Body: { instrumentIdId } e.g. "USDCx" / "Amulet". */
+app.post('/admin/accrue-interest', async (req, res) => {
+  try {
+    const { instrumentIdId } = req.body;
+    if (!instrumentIdId) {
+      return res.status(400).json({ success: false, error: 'instrumentIdId is required (e.g. "USDCx" or "Amulet")' });
+    }
+    const out = await exerciseReserveChoiceAndRepoint(instrumentIdId, 'AccrueInterest', {});
+    console.log(`AccrueInterest ${instrumentIdId}: reserve=${out.newReserveCid}, pool=${out.newPoolCid}`);
+    res.json({
+      success: true,
+      instrumentIdId,
+      previousLiquidityIndex: out.previous?.liquidityIndex,
+      previousBorrowIndex: out.previous?.variableBorrowIndex,
+      ...out,
+    });
+  } catch (e) {
+    console.error('ACCRUE INTEREST error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 /** GET /admin/liquidatable — scan every UserPosition, compute HF off-chain, and return the
  *  ones with HF < 1 along with the borrower's private-position blobs (the operator-mediated
  *  disclosure a liquidator needs to see them). HF here is approximate — the DAR re-verifies

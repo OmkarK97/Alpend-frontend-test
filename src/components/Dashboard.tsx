@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import type { LoopProvider, TransactionPayload } from '../loop/provider';
-import type { PositionData, TransactionLog as TxLog } from '../types';
+import type { PositionData, TransactionLog as TxLog, DepositPosition } from '../types';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { buildInitializeUserPositionCommand } from '../commands/pool';
-import { fetchPoolDisclosedContracts } from '../utils/transferContext';
+import { buildEnableCollateralCommand, buildDisableCollateralCommand } from '../commands/collateral';
+import { fetchPoolDisclosedContracts, fetchLiveCids, poolCidFromDisclosed } from '../utils/transferContext';
+import { fmtBalance } from '../utils/format';
 import { SupplyModal } from './SupplyModal';
 import { BorrowModal } from './BorrowModal';
 import { WithdrawModal } from './WithdrawModal';
@@ -54,6 +56,47 @@ export function Dashboard({
 }: Props) {
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [initLoading, setInitLoading] = useState(false);
+  const [togglingCid, setTogglingCid] = useState<string | null>(null);
+
+  // Enable/disable a supply position as collateral. No token transfer; DisableCollateral
+  // re-checks HF >= 1 on-chain (so it needs the OTHER reserves for the basket).
+  const handleToggleCollateral = async (dep: DepositPosition) => {
+    setTogglingCid(dep.cid);
+    try {
+      const [live, disclosed] = await Promise.all([
+        fetchLiveCids(partyId),
+        fetchPoolDisclosedContracts(partyId),
+      ]);
+      const instr = dep.instrumentId.id;
+      const poolCid = poolCidFromDisclosed(disclosed, live.poolCid || position.poolCid);
+      const assetReserveCid = live.reservesByInstrument[instr];
+      const userPositionCid = live.userPositionCid || position.userPositionCid;
+      if (!poolCid || !assetReserveCid || !userPositionCid) {
+        throw new Error('Missing pool/reserve/user-position CID. Try refreshing.');
+      }
+      if (dep.isUsedAsCollateral) {
+        const accountReserveCids = Object.entries(live.reservesByInstrument)
+          .filter(([id]) => id !== instr)
+          .map(([, cid]) => cid);
+        const cmd = buildDisableCollateralCommand(
+          { supplier: partyId, poolCid, depositPositionCid: dep.cid, assetReserveCid, userPositionCid, accountReserveCids, featuredAppRightCid: null },
+          disclosed
+        );
+        await submitTx('DisableCollateral', cmd, `Disable ${instr} collateral`, { estimateTraffic: false });
+      } else {
+        const cmd = buildEnableCollateralCommand(
+          { supplier: partyId, poolCid, depositPositionCid: dep.cid, assetReserveCid, userPositionCid, featuredAppRightCid: null },
+          disclosed
+        );
+        await submitTx('EnableCollateral', cmd, `Enable ${instr} collateral`, { estimateTraffic: false });
+      }
+      await position.refresh();
+    } catch (err) {
+      addLog('ToggleCollateral', 'error', `Failed: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      setTogglingCid(null);
+    }
+  };
 
   const netWorth =
     parseFloat(position.totalSupplied) - parseFloat(position.totalBorrowed);
@@ -215,19 +258,19 @@ export function Dashboard({
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.walletBalance).toFixed(4)}
+                {fmtBalance(position.walletBalance)}
               </span>
               <span className="cell-label">USDCx</span>
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.usdcxSupplied).toFixed(4)}
+                {fmtBalance(position.usdcxSupplied)}
               </span>
               <span className="cell-label">USDCx</span>
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.usdcxBorrowed).toFixed(4)}
+                {fmtBalance(position.usdcxBorrowed)}
               </span>
               <span className="cell-label">USDCx</span>
             </div>
@@ -285,19 +328,19 @@ export function Dashboard({
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.ccWalletBalance).toFixed(4)}
+                {fmtBalance(position.ccWalletBalance)}
               </span>
               <span className="cell-label">CC</span>
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.ccSupplied).toFixed(4)}
+                {fmtBalance(position.ccSupplied)}
               </span>
               <span className="cell-label">CC</span>
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {parseFloat(position.ccBorrowed).toFixed(4)}
+                {fmtBalance(position.ccBorrowed)}
               </span>
               <span className="cell-label">CC</span>
             </div>
@@ -355,14 +398,27 @@ export function Dashboard({
                 <div className="position-info">
                   <span className="position-asset">{dep.instrumentId.id}</span>
                   <span className="position-amount">
-                    {parseFloat(dep.principal).toFixed(4)}
+                    {fmtBalance(dep.principal)}
                   </span>
                 </div>
-                <span
-                  className={`collateral-badge ${dep.isUsedAsCollateral ? 'collateral-on' : 'collateral-off'}`}
-                >
-                  {dep.isUsedAsCollateral ? 'Collateral' : 'Not Collateral'}
-                </span>
+                <div className="position-collateral">
+                  <span
+                    className={`collateral-badge ${dep.isUsedAsCollateral ? 'collateral-on' : 'collateral-off'}`}
+                  >
+                    {dep.isUsedAsCollateral ? 'Collateral' : 'Not Collateral'}
+                  </span>
+                  <button
+                    className="btn-collateral-toggle"
+                    onClick={() => handleToggleCollateral(dep)}
+                    disabled={togglingCid !== null}
+                  >
+                    {togglingCid === dep.cid
+                      ? '…'
+                      : dep.isUsedAsCollateral
+                      ? 'Disable'
+                      : 'Enable'}
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -380,7 +436,7 @@ export function Dashboard({
                     {bor.instrumentId.id}
                   </span>
                   <span className="position-amount">
-                    {parseFloat(bor.principal).toFixed(4)}
+                    {fmtBalance(bor.principal)}
                   </span>
                 </div>
               </div>

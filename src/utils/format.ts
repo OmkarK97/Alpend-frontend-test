@@ -46,6 +46,17 @@ export function fmtAmount(v: number | string, minDp = 2): string {
   return fmtDecimal(v, minDp);
 }
 
+/** Token balance for user-facing rows. Never renders a NON-ZERO amount as "0.0000":
+ *  a tiny-but-positive value (dust, e.g. leftover accrued-interest debt) shows as "< 0.0001"
+ *  so a user is never told they owe/hold nothing when they actually don't. */
+export function fmtBalance(v: number | string, dp = 4): string {
+  const n = typeof v === 'string' ? parseFloat(v) : v;
+  if (!isFinite(n) || n === 0) return (0).toFixed(dp);
+  const eps = Math.pow(10, -dp);
+  if (Math.abs(n) < eps) return `${n < 0 ? '> -' : '< '}${eps.toFixed(dp)}`;
+  return n.toFixed(dp);
+}
+
 /** USD currency. Sub-$1 prices get more precision. */
 export function fmtUsd(v: number | string): string {
   const n = typeof v === 'string' ? parseFloat(v) : v;
