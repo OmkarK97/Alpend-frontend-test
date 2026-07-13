@@ -247,6 +247,40 @@ function AccrueInterestCard({ asset, onDone }: { asset: AdminAsset; onDone: () =
   );
 }
 
+/* ---- Withdraw Protocol Revenue ------------------------------------------ */
+function WithdrawRevenueCard({ asset, onDone }: { asset: AdminAsset; onDone: () => void }) {
+  const [amount, setAmount] = useState('');
+  const [status, setStatus] = useState<Status>({ kind: 'idle' });
+  const [busy, setBusy] = useState(false);
+  const ccOnly = asset.instrumentId !== 'Amulet';
+
+  const submit = async () => {
+    setBusy(true); setStatus({ kind: 'idle' });
+    const r = await postAdmin('/admin/withdraw-revenue', { instrumentIdId: asset.instrumentId, amount });
+    setBusy(false);
+    if (r.success) { setStatus({ kind: 'ok', msg: `Withdrew ${amount} ${asset.symbol} to treasury` }); setAmount(''); onDone(); }
+    else setStatus({ kind: 'err', msg: r.error || 'Failed' });
+  };
+
+  return (
+    <div className="admin-card">
+      <h4 className="admin-card-title">Protocol revenue</h4>
+      <p className="admin-card-desc">
+        The reserve factor accrues protocol revenue from borrow interest. The treasury can withdraw
+        it (not supplier funds). Extractable now: <strong>{fmtDecimal(asset.revenue)} {asset.symbol}</strong>.
+      </p>
+      <Field label={`Amount to withdraw`} value={amount} onChange={setAmount} suffix={asset.symbol} />
+      {ccOnly ? (
+        <div className="admin-field-hint">Only CC revenue withdrawal is wired currently.</div>
+      ) : null}
+      <button className="btn btn-primary btn-sm" onClick={submit} disabled={busy || ccOnly || !amount || parseFloat(amount) <= 0}>
+        {busy ? 'Withdrawing…' : 'Withdraw Revenue'}
+      </button>
+      <StatusLine status={status} />
+    </div>
+  );
+}
+
 /* ---- Section ------------------------------------------------------------ */
 export function ManageAssets({ data }: { data: AdminData }) {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -282,6 +316,7 @@ export function ManageAssets({ data }: { data: AdminData }) {
           <RiskParamsCard asset={asset} onDone={data.refresh} />
           <InterestRatesCard asset={asset} onDone={data.refresh} />
           <AccrueInterestCard asset={asset} onDone={data.refresh} />
+          <WithdrawRevenueCard asset={asset} onDone={data.refresh} />
           <RefreshHoldingsCard asset={asset} onDone={data.refresh} />
         </div>
       )}

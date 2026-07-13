@@ -121,10 +121,16 @@ export function LiquidationsPage({ partyId, position, submitTx }: Props) {
     }
 
     // Liquidator repays 50% of debt (safe under the close factor; DAR re-asserts),
-    // capped by the liquidator's own balance of the debt asset.
+    // capped by the liquidator's own balance of the debt asset AND by what the borrower's
+    // collateral can actually cover — the DAR reverts if the seize exceeds available collateral
+    // ("Insufficient collateral to seize"). For an under-collateralised position this cap makes
+    // the liquidator seize ALL the collateral and leave residual (bad) debt behind.
     const liqDebtHoldings = debtKey === 'usdcx' ? position.usdcxHoldings : position.ccHoldings;
     const liqDebtBalance = liqDebtHoldings.reduce((s, h) => s + parseFloat(h.amount), 0);
-    const repay = Math.min(debt.amount * 0.5, liqDebtBalance);
+    const bonus = collateral.liquidationBonus || 0;
+    // max repay whose seize == all available collateral: seize = repay*debtPrice*(1+bonus)/collPrice
+    const maxRepayByCollateral = (collateral.amount * collateral.price) / (debt.price * (1 + bonus));
+    const repay = Math.min(debt.amount * 0.5, liqDebtBalance, maxRepayByCollateral);
     if (repay <= 0) {
       setError(`You hold no ${ASSETS[debtKey].symbol} to repay this debt with.`);
       return;

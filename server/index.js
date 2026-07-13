@@ -1061,6 +1061,181 @@ app.post('/admin/accrue-interest', async (req, res) => {
   }
 });
 
+/** POST /admin/withdraw-revenue — treasury pulls accrued protocol revenue from a reserve.
+ *  Exercises Pool.WithdrawProtocolRevenue (controller treasuryParty; == poolOperator on testnet, so
+ *  the server can sign). It's a pool→treasury token transfer, so it needs the reserve's holdings
+ *  (FIND-025: must cover full liquidity) + the registry transfer context; then re-points the pool
+ *  (the AssetReserve CID churns via the internal AccrueInterest + RecordRevenueWithdrawal).
+ *  CC (Amulet) only for now. Body: { instrumentIdId: "Amulet", amount }. */
+app.post('/admin/withdraw-revenue', async (req, res) => {
+  try {
+    const { instrumentIdId, amount } = req.body;
+    if (!instrumentIdId || !amount) {
+      return res.status(400).json({ success: false, error: 'instrumentIdId and amount are required' });
+    }
+    if (instrumentIdId !== 'Amulet') {
+      return res.status(400).json({ success: false, error: 'Only Amulet (CC) revenue withdrawal is wired currently' });
+    }
+    const RESERVE_TID = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
+    const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+
+    const reserves = await queryContracts(RESERVE_TID, POOL_OPERATOR);
+    const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
+    if (!reserve) return res.status(404).json({ success: false, error: `No reserve for ${instrumentIdId}` });
+    const feedId = reserve.createArgument?.riskParams?.priceFeedId;
+
+    // Use the operator's LIVE CC holdings (avoids the ephemeral stale-CID issue); they must
+    // cover the reserve's full liquidity (FIND-025), which they do since the pool is CC-solvent.
+    const holdings = await queryCCHoldings(POOL_OPERATOR);
+    const currentHoldingCids = holdings.map((h) => h.contractId).filter(Boolean);
+    if (currentHoldingCids.length === 0) {
+      return res.status(400).json({ success: false, error: 'Operator holds no CC to transfer' });
+    }
+
+    // Registry transfer context for a poolOperator -> treasury(=poolOperator) transfer.
+    const factoryData = await fetchCCTransferFactory(POOL_OPERATOR, {
+      receiver: POOL_OPERATOR,
+      amount: String(amount),
+      inputHoldingCids: currentHoldingCids,
+    });
+    const transferFactoryCid = factoryData.factoryId;
+    if (!transferFactoryCid) return res.status(502).json({ success: false, error: 'No transfer factory from registry' });
+    const choiceContext = factoryData.choiceContext?.choiceContextData || { values: {} };
+    const disclosedContracts = (factoryData.choiceContext?.disclosedContracts || []).map((dc) => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      synchronizerId: dc.synchronizerId || dc.domainId,
+    }));
+
+    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pool = pools[pools.length - 1];
+    if (!pool?.contractId) return res.status(404).json({ success: false, error: 'No active LendingPool' });
+
+    const result = await submitCommand([
+      {
+        ExerciseCommand: {
+          templateId: POOL_TID,
+          contractId: pool.contractId,
+          choice: 'WithdrawProtocolRevenue',
+          choiceArgument: {
+            assetReserveCid: reserve.contractId,
+            transferFactoryCid,
+            currentHoldingCids,
+            amount: String(amount),
+            choiceContext,
+            featuredAppRightCid: null,
+          },
+        },
+      },
+    ], [POOL_OPERATOR], disclosedContracts);
+
+    // Returns (new AssetReserve, revenue Holding) + internal AccrueInterest reserve — take the LAST AssetReserve created.
+    const events = result.transaction?.events || [];
+    const newReserveCid = events
+      .filter((e) => e.CreatedEvent?.templateId?.includes('AssetReserve'))
+      .map((e) => e.CreatedEvent.contractId)
+      .slice(-1)[0];
+
+    // Re-point the pool at the new reserve CID (WithdrawProtocolRevenue is nonconsuming on the pool,
+    // so pool.contractId is still valid here).
+    let newPoolCid = null;
+    if (newReserveCid && feedId) {
+      const upd = await submitCommand([
+        { ExerciseCommand: { templateId: POOL_TID, contractId: pool.contractId, choice: 'UpdateAssetReserveCid', choiceArgument: { feedId, newReserveCid } } },
+      ], [POOL_OPERATOR]);
+      newPoolCid = extractContractId(upd);
+    }
+
+    console.log(`WithdrawProtocolRevenue ${instrumentIdId} amount=${amount}: reserve=${newReserveCid}, pool=${newPoolCid}`);
+    res.json({ success: true, instrumentIdId, amount: String(amount), newReserveCid, newPoolCid, updateId: result.transaction?.updateId || result.updateId });
+  } catch (e) {
+    console.error('WITHDRAW REVENUE error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/write-off-bad-debt — operator writes off an uncollectable borrow (H-3).
+ *  Exercises Pool.WriteOffBadDebt (controller poolOperator). Only permitted when the borrower has
+ *  ZERO collateral value left but still owes debt (recomputed on-chain). Reduces scaledTotalBorrowed
+ *  and applies a proportional liquidityIndex HAIRCUT to suppliers (FIND-026 — note: the Pool source
+ *  comment "suppliers are not haircut" is stale; the reserve code does haircut). Re-points the pool
+ *  (reserve churns). Body: { borrower, instrumentIdId } — instrumentIdId is the DEBT asset. */
+app.post('/admin/write-off-bad-debt', async (req, res) => {
+  try {
+    const { borrower, instrumentIdId } = req.body;
+    if (!borrower || !instrumentIdId) {
+      return res.status(400).json({ success: false, error: 'borrower and instrumentIdId (debt asset) are required' });
+    }
+    const P = `#alpend-lending-final-loop:Lending.`;
+    const RESERVE_TID = `${P}AssetReserve:AssetReserve`;
+    const POOL_TID = `${P}Pool:LendingPool`;
+
+    const [reserves, borrows, userPositions] = await Promise.all([
+      queryContracts(RESERVE_TID, POOL_OPERATOR),
+      queryContracts(`${P}Borrow:BorrowPosition`, POOL_OPERATOR),
+      queryContracts(`${P}UserPosition:UserPosition`, POOL_OPERATOR),
+    ]);
+
+    const debtReserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
+    if (!debtReserve) return res.status(404).json({ success: false, error: `No reserve for ${instrumentIdId}` });
+    const feedId = debtReserve.createArgument?.riskParams?.priceFeedId;
+
+    const borrowPos = borrows
+      .filter((b) => b.createArgument?.borrower === borrower && b.createArgument?.instrumentId?.id === instrumentIdId)
+      .slice(-1)[0];
+    if (!borrowPos) return res.status(404).json({ success: false, error: `No ${instrumentIdId} borrow for that borrower` });
+
+    const userPos = userPositions.filter((u) => u.createArgument?.user === borrower).slice(-1)[0];
+    if (!userPos) return res.status(404).json({ success: false, error: 'No UserPosition for that borrower' });
+
+    // Every OTHER reserve the borrower could have collateral in (for the on-chain collateral recompute).
+    const accountReserveCids = reserves
+      .filter((r) => r.createArgument?.instrumentId?.id !== instrumentIdId)
+      .map((r) => r.contractId);
+
+    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pool = pools[pools.length - 1];
+
+    const result = await submitCommand([
+      {
+        ExerciseCommand: {
+          templateId: POOL_TID,
+          contractId: pool.contractId,
+          choice: 'WriteOffBadDebt',
+          choiceArgument: {
+            borrower,
+            borrowPositionCid: borrowPos.contractId,
+            debtAssetReserveCid: debtReserve.contractId,
+            borrowerPositionCid: userPos.contractId,
+            accountReserveCids,
+          },
+        },
+      },
+    ], [POOL_OPERATOR]);
+
+    const events = result.transaction?.events || [];
+    const newReserveCid = events
+      .filter((e) => e.CreatedEvent?.templateId?.includes('AssetReserve'))
+      .map((e) => e.CreatedEvent.contractId)
+      .slice(-1)[0];
+
+    let newPoolCid = null;
+    if (newReserveCid && feedId) {
+      const upd = await submitCommand([
+        { ExerciseCommand: { templateId: POOL_TID, contractId: pool.contractId, choice: 'UpdateAssetReserveCid', choiceArgument: { feedId, newReserveCid } } },
+      ], [POOL_OPERATOR]);
+      newPoolCid = extractContractId(upd);
+    }
+
+    console.log(`WriteOffBadDebt ${instrumentIdId} borrower=${borrower.slice(0, 16)}: reserve=${newReserveCid}, pool=${newPoolCid}`);
+    res.json({ success: true, borrower, instrumentIdId, newReserveCid, newPoolCid, updateId: result.transaction?.updateId || result.updateId });
+  } catch (e) {
+    console.error('WRITE OFF BAD DEBT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 /** GET /admin/liquidatable — scan every UserPosition, compute HF off-chain, and return the
  *  ones with HF < 1 along with the borrower's private-position blobs (the operator-mediated
  *  disclosure a liquidator needs to see them). HF here is approximate — the DAR re-verifies

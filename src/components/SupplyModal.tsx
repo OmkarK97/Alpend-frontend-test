@@ -96,7 +96,10 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
           assetReserveCid: live.reservesByInstrument[cfg.instrumentId] || reserveCid,
           userPositionCid: live.userPositionCid || position.userPositionCid,
           enableAsCollateral,
-          existingDepositCid: null,
+          // Position unification: if a deposit for this asset already exists, merge into it
+          // (DAR realizes its accrued value + adds this supply → one position, not a duplicate).
+          existingDepositCid:
+            live.depositsByInstrument[cfg.instrumentId] || cfg.depositPosition(position)?.cid || null,
           choiceContext: ctx.choiceContext,
           reason: `${cfg.symbol} Supply`,
           featuredAppRightCid: null,

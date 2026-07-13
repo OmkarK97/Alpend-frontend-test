@@ -33,6 +33,7 @@ export interface AdminAsset {
   scaledBorrowed: number;
   borrowed: number;       // scaledBorrowed × variableBorrowIndex
   utilization: number;    // borrowed / (liquidity + borrowed)
+  revenue: number;        // extractable protocol revenue = poolEntitled − suppliersOwed
   isActive: boolean;
   risk: AdminRiskParams;
   interest: AdminInterestParams | null;
@@ -103,6 +104,9 @@ export function useAdminData(): AdminData {
         const borrowed = scaledBorrowed * borrowIdx;
         const totalDeposited = parseFloat(a.totalDeposited || '0');
         const denom = totalLiquidity + borrowed;
+        // reserveProtocolRevenue = max(0, poolEntitled − suppliersOwed)
+        const suppliersOwed = parseFloat(a.scaledTotalSupplied || '0') * parseFloat(a.liquidityIndex || '1');
+        const revenue = Math.max(0, (totalLiquidity + borrowed) - suppliersOwed);
         out.push({
           key,
           symbol: cfg.symbol,
@@ -115,6 +119,7 @@ export function useAdminData(): AdminData {
           scaledBorrowed,
           borrowed,
           utilization: denom > 0 ? borrowed / denom : 0,
+          revenue,
           isActive: risk.isActive ?? true,
           risk: {
             ltv: risk.ltv ?? '0',

@@ -145,7 +145,9 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
           // Other reserves backing the user's collateral so the DAR's on-chain HF
           // counts the full basket.
           accountReserveCids,
-          existingBorrowCid: null,
+          // Position unification: merge into the existing borrow for this asset if there is one.
+          existingBorrowCid:
+            live.borrowsByInstrument[cfg.instrumentId] || cfg.borrowPosition(position)?.cid || null,
           // Ephemeral assets (CC) must pass fresh pool holdings covering full reserve
           // liquidity (FIND-025); stable assets (USDCx) use stored holdings.
           freshReserveHoldingCids: cfg.isEphemeral ? poolHoldings.cids : null,
