@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import type { LoopProvider } from '../loop/provider';
 import { ADMIN_API_URL, USDCX_HOLDING_INTERFACE_ID } from '../config';
+import { resolveOraclePrice } from '../utils/price';
 import type {
   PositionData,
   DepositPosition,
@@ -464,9 +465,15 @@ export function usePosition(
 
       // USD aggregates — the post-audit DAR no longer caches these on UserPosition, so
       // compute them here from positions × live oracle prices × per-asset risk params.
-      const prices =
-        (poolStatusResp as { oracle?: { prices?: Record<string, { price?: string }> } })
-          ?.oracle?.prices || {};
+      const oracle =
+        (poolStatusResp as {
+          oracle?: {
+            prices?: Record<string, { price?: string }>;
+            feedAliases?: Record<string, string>;
+          };
+        })?.oracle;
+      const prices = oracle?.prices || {};
+      const feedAliases = oracle?.feedAliases || {};
       const assetInfo: Record<string, { price: number; ltv: number; liqThreshold: number }> = {};
       for (const c of (reserveResp.contracts || []) as Array<{
         createArgument?: {
@@ -479,7 +486,7 @@ export function usePosition(
         const feed = a?.riskParams?.priceFeedId || '';
         if (id) {
           assetInfo[id] = {
-            price: parseFloat(prices[feed]?.price || '0'),
+            price: resolveOraclePrice(prices, feedAliases, feed),
             ltv: parseFloat(a?.riskParams?.ltv || '0'),
             liqThreshold: parseFloat(a?.riskParams?.liquidationThreshold || '0'),
           };

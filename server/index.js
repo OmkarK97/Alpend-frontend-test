@@ -330,11 +330,21 @@ app.get('/admin/pool-status', async (req, res) => {
       queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
     ]);
 
-    const latestOracle = oracleContracts[oracleContracts.length - 1];
     const latestPool = poolContracts[poolContracts.length - 1];
+    // Show the oracle the POOL actually points at — not "last active oracle". After a
+    // rebuild-oracle the orphaned old oracle still lingers, and picking it would surface its
+    // stale prices/aliases here. feedAliases is included so the frontend can resolve a reserve's
+    // feed LABEL (e.g. "cc-feed") to the raw feed id the live price is stored under.
+    const poolOracleCid = latestPool?.createArgument?.oracleCid;
+    const latestOracle = oracleContracts.find((o) => o.contractId === poolOracleCid)
+      || oracleContracts[oracleContracts.length - 1];
 
     const status = {
-      oracle: latestOracle ? { cid: latestOracle.contractId, prices: latestOracle.createArgument?.prices } : null,
+      oracle: latestOracle ? {
+        cid: latestOracle.contractId,
+        prices: latestOracle.createArgument?.prices,
+        feedAliases: latestOracle.createArgument?.feedAliases,
+      } : null,
       pool: latestPool ? {
         cid: latestPool.contractId,
         observers: latestPool.createArgument?.observers,
@@ -3206,4 +3216,14 @@ app.listen(PORT, () => {
   console.log(`Admin server running on port ${PORT}`);
   console.log(`Pool Operator: ${POOL_OPERATOR}`);
   console.log(`Lending Package: ${LENDING_PACKAGE_ID}`);
+
+  // Auto-resume the oracle price-push loop on boot when ORACLE_PUSH_AUTOSTART=true. The loop
+  // lives in memory, so without this a redeploy — or a free-tier spin-down/wake — would silently
+  // stop price pushes until someone manually hit /admin/oracle-push/start, and prices would go
+  // stale (reads eventually abort). Off by default so a local dev server doesn't spin up a second
+  // writer competing with the deployed one; set the env var only on the host that should push.
+  if (process.env.ORACLE_PUSH_AUTOSTART === 'true') {
+    console.log('[oracle-loop] auto-starting on boot (ORACLE_PUSH_AUTOSTART=true)');
+    startOraclePush();
+  }
 });

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ADMIN_API_URL } from '../config';
 import { ASSETS } from '../assets';
+import { resolveOraclePrice } from '../utils/price';
 
 export interface AdminRiskParams {
   ltv: string;
@@ -81,6 +82,7 @@ export function useAdminData(): AdminData {
       ]);
 
       const prices: Record<string, { price?: string }> = statusResp?.oracle?.prices || {};
+      const feedAliases: Record<string, string> = statusResp?.oracle?.feedAliases || {};
       setPoolCid(statusResp?.pool?.cid || '');
       setPauseFlags(statusResp?.pool?.pauseFlags || EMPTY_PAUSE);
       setOracleFresh(!!statusResp?.oracle);
@@ -97,7 +99,7 @@ export function useAdminData(): AdminData {
         const a = r.createArgument as Record<string, any>;
         const risk = a.riskParams || {};
         const feedId = risk.priceFeedId || '';
-        const price = parseFloat(prices[feedId]?.price || '0');
+        const price = resolveOraclePrice(prices, feedAliases, feedId);
         const totalLiquidity = parseFloat(a.totalLiquidity || '0');
         const scaledBorrowed = parseFloat(a.scaledTotalBorrowed || '0');
         const borrowIdx = parseFloat(a.variableBorrowIndex || '1');
