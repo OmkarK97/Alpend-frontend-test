@@ -6,6 +6,8 @@
 > works. If you're picking up the new UI, read this top-to-bottom first.
 
 Related deep-dives (Claude memory): `reserve-holding-cid-drift`, `stale-cid-fetch-live-at-submit`,
+`ephemeral-cc-user-holding-race`, `new-user-foreign-userposition`, `poolOperator-fund-safety-3of4`,
+`bad-debt-writeoff-1e10-underflow`, `solvency-invariant-checker`, `migration-phase-m-validated`,
 `ui-migration-portable-integration`.
 
 ---
@@ -58,20 +60,20 @@ All framework-agnostic. Copy these into the new UI (or promote to a shared packa
 
 | Area | Path | What it is |
 |---|---|---|
-| Command builders | `src/commands/*.ts` | Pure functions: typed args → Daml `ExerciseCommand` payload + disclosed contracts. `deposit.ts` (supply), `withdraw.ts`, `borrow.ts`, `repay.ts`, `liquidate.ts`, `pool.ts` (initialize user position + pool ops). |
-| Context / CIDs | `src/utils/transferContext.ts` | `fetchLiveCids`, `poolCidFromDisclosed`, `fetchTransferContext`, `fetchCCTransferContext`, `fetchCCPayoutContext`, `fetchPoolDisclosedContracts`, `fetchPoolHoldings`. |
+| Command builders | `src/commands/*.ts` | Pure functions: typed args → Daml `ExerciseCommand` payload + disclosed contracts. `deposit.ts` (supply), `withdraw.ts`, `borrow.ts`, `repay.ts`, `liquidate.ts`, `collateral.ts` (enable/disable collateral), `migration.ts` (`buildMigrationAcceptCommand` + a test-only registry-archive), `pool.ts` (initialize user position + pool ops). |
+| Context / CIDs | `src/utils/transferContext.ts` | `fetchLiveCids` (re-resolves pool/reserve/userpos/deposit/borrow CIDs at submit), `poolCidFromDisclosed`, `isContractNotFound` + `withEphemeralRetry` (one rebuild+retry for CC), `fetchTransferContext`, `fetchCCTransferContext`, `fetchCCPayoutContext`, `fetchPoolDisclosedContracts`, `fetchPoolHoldings`. |
 | Loop wallet | `src/loop/provider.ts` | `initLoop`, `connectLoop`, `logoutLoop`, `LoopProvider` type. |
 | Asset registry | `src/assets.ts` | `ASSETS` (usdcx/cc) — per-asset symbol, `instrumentId`, `isEphemeral`, and the send-context/holdings helpers each asset uses. **Add a new asset here, not in components.** |
 | Config | `src/config.ts` | `LENDING_PACKAGE_ID`, `SYNCHRONIZER_ID`, `POOL_OPERATOR`, `ADMIN_API_URL`, template/interface ids, instrument admins. **Single source for DAR-version-sensitive constants.** |
-| Types | `src/types.ts` | `DisclosedContract`, `PositionData`, `DepositPosition`, `BorrowPosition`, holdings, etc. |
-| Formatting | `src/utils/format.ts` | Human display: `fmtDecimal`, `fmtPercent`, `fmtUsd`, `decimalToPctInput`, `pctInputToDecimal`. |
+| Types | `src/types.ts` | `DisclosedContract`, `PositionData` (incl. `getFreshHoldings`, `assetInfo`), `DepositPosition`, `BorrowPosition`, holdings, etc. |
+| Formatting | `src/utils/format.ts` | Human display: `fmtDecimal`, `fmtPercent`, `fmtUsd`, `fmtAmount`, `fmtBalance` (dust-safe: shows `< 0.0001` not `0.0000`), `decimalToPctInput`, `pctInputToDecimal`. |
 
 **React adapters (rewrite/port depending on the new UI's framework):**
 
 | Hook | Path | Role |
 |---|---|---|
 | `useLoop` | `src/hooks/useLoop.ts` | Wallet connect + `submitTx(operation, payload, message, {estimateTraffic})` + logs. |
-| `usePosition` | `src/hooks/usePosition.ts` | Reads positions/holdings, computes USD aggregates + HF locally, `refresh()`. |
+| `usePosition` | `src/hooks/usePosition.ts` | Reads positions/holdings, computes **accrued** value (`principal × currentIndex/entryIndex`) + USD aggregates + HF locally, `refresh()`, `getFreshHoldings()` (re-fetch wallet holdings at submit for the CC race). |
 | `useAdminData` | `src/hooks/useAdminData.ts` | Reads reserves + oracle prices + pause flags for the Admin page. |
 | `useContracts` | `src/hooks/useContracts.ts` | Raw contract listing (ContractExplorer). |
 
@@ -119,12 +121,14 @@ form (`#alpend-lending-final-loop:Lending.Pool:LendingPool`).
 
 | UI action | Command builder | Direction | Notes |
 |---|---|---|---|
-| Supply | `buildSupplyTSWithPositionCommand` (`deposit.ts`) | user-as-sender | `existingDepositCid` unifies with an existing position; `enableAsCollateral` flag. |
+| Supply | `buildSupplyTSWithPositionCommand` (`deposit.ts`) | user-as-sender | Pass `existingDepositCid` (from `fetchLiveCids`) to **unify** with an existing position; `enableAsCollateral` flag. Wrap in `withEphemeralRetry` + `getFreshHoldings` for CC. |
 | Withdraw | `buildWithdrawTSWithPositionCommand` | pool-as-sender | `withdrawAmount = null` = full; DAR auto-caps to max-safe when there's debt. CC needs `freshReserveHoldingCids`. |
-| Borrow | `buildBorrowTSWithPositionCommand` | pool-as-sender | `accountReserveCids` = other reserves (HF basket). CC needs `freshReserveHoldingCids`. |
-| Repay | `buildRepayTSWithPositionCommand` | user-as-sender | `repayAmount = null` = full. |
-| Liquidate | `buildLiquidateTSCommand` (`liquidate.ts`) | two-sided | Operator-mediated disclosure of the borrower's private positions (via `/admin/liquidatable`); repay leg + seize leg. |
-| Init user position | `buildInitializeUserPositionCommand` (`pool.ts`) | user | First-time per-user setup. |
+| Borrow | `buildBorrowTSWithPositionCommand` | pool-as-sender | `accountReserveCids` = other reserves (HF basket). Pass `existingBorrowCid` to unify. CC needs `freshReserveHoldingCids`. |
+| Repay | `buildRepayTSWithPositionCommand` | user-as-sender | `repayAmount = null` = full (clears the borrow, no residual); a *partial* repay short of the accrued debt leaves a residual. `withEphemeralRetry` + `getFreshHoldings` for CC. |
+| Enable/Disable collateral | `buildEnableCollateralCommand` / `buildDisableCollateralCommand` (`collateral.ts`) | user, **no token transfer** | Only needs the pool disclosed set (no transfer factory). Disable re-checks HF ≥ 1 on-chain → pass `accountReserveCids`. |
+| Liquidate | `buildLiquidateTSCommand` (`liquidate.ts`) | two-sided | Operator-mediated disclosure of the borrower's private positions (via `/admin/liquidatable`); repay leg + seize leg. Repay is capped by `min(debt×closeFactor, liqBalance, collateral-can-cover)` — DAR reverts if seize > available collateral. |
+| Init user position | `buildInitializeUserPositionCommand` (`pool.ts`) | user | First-time per-user setup. New users must init before their first supply. |
+| **Migrate (accept)** | `buildMigrationAcceptCommand` (`migration.ts`) | user, **no token transfer** | Legacy→DAR. Single-controller (`user`); operator authority comes from signatory propagation, so **Loop can sign it alone**. Pass `reserveCids` resolved **fresh at accept** (via `fetchLiveCids`) + the pool disclosed set. Creates UserPosition + Deposit/Borrow positions and bumps reserve totals atomically. See `MigrationBanner.tsx` for the reference flow. |
 
 ---
 
@@ -134,15 +138,39 @@ Base URL = `ADMIN_API_URL` (dev `http://localhost:3100`). Reads + context + admi
 
 **Reads:** `GET /admin/pool-status`, `GET /admin/asset-reserves`, `GET /query/lending-pool`,
 `GET /query/user-position/:party`, `GET /query/deposit-position/:party`, `GET /query/borrow-position/:party`,
-`GET /admin/usdcx-holdings/:party`, `GET /admin/cc-holdings/:party`, `GET /admin/liquidatable`.
+`GET /admin/usdcx-holdings/:party`, `GET /admin/cc-holdings/:party`, `GET /admin/liquidatable`,
+`GET /admin/solvency` (protocol-health invariant sweep), `GET /admin/migration-snapshot/:party`.
 
 **Context / disclosure:** `POST /admin/usdcx-transfer-context`, `GET /admin/cc-transfer-context`,
 `POST /admin/cc-payout-context`, `GET /admin/pool-disclosed-contracts?party=`.
 
-**Admin choices (operator-signed):** `POST /admin/set-price`, `POST /admin/update-risk-params`,
-`POST /admin/update-interest-params`, `POST /admin/set-pause-flags`, `POST /admin/refresh-holdings`,
-plus one-time setup (`create-oracle`, `create-pool`, `add-asset-reserve`, `grant-*`, …) and operator
-transfers (`send-usdcx`, `send-cc`).
+**Admin choices (operator-signed):** `POST /admin/set-price`, `POST /admin/update-risk-params` (incl.
+deposit/borrow caps), `POST /admin/update-interest-params`, `POST /admin/set-pause-flags`,
+`POST /admin/refresh-holdings`, `POST /admin/accrue-interest` (force index advance),
+`POST /admin/withdraw-revenue` (treasury pulls protocol revenue — CC only so far),
+`POST /admin/write-off-bad-debt` (operator clears uncollectable debt), plus one-time setup
+(`create-oracle`, `create-pool`, `add-asset-reserve`, `grant-*`, …) and operator transfers
+(`send-usdcx`, `send-cc`).
+
+**Migration (Phase M):** `POST /admin/create-migration-snapshot` (operator prepares a user's snapshot),
+`POST /admin/cancel-migration-snapshot` (`MigrationCancel` — expired/superseded cleanup).
+
+> **⚠ MANDATORY (NEW-03):** `create-migration-snapshot` **refuses** (409) if the user already has a
+> `UserPosition`. The DAR *cannot* enforce one-registry-per-user (UserPosition is keyless by design), so
+> `MigrationAccept` would happily create a SECOND registry → permanent CID-mismatch failures for that
+> user. **Any new snapshot-issuing path MUST carry this guard.** (`allowExistingRegistry: true` is a
+> test-only escape hatch.) See memory `migration-phase-m-validated`.
+
+**Oracle (Phase 2 — Chainlink Data Streams):** `GET /admin/oracle-verifier-contracts` (find the
+Verifier/VerifierConfig CIDs once Chainlink grants observer access), `POST /admin/set-verifier` (pin them),
+`POST /admin/register-feed` (canonical label → raw `0003…` feed id), `POST /admin/push-price` (fetch a
+signed report → `UpdatePrice`), `POST /admin/oracle-push/{start,stop}` + `GET /admin/oracle-push/status`
+(the continuous bot). Fetch/HMAC lives in `server/chainlinkDataStreams.js`; it passes the **raw
+`fullReport`** to the DAR, which verifies + decodes on-chain.
+
+> **Note (`treasuryParty`):** `withdraw-revenue` is `controller treasuryParty`; the server can sign it
+> only because `treasuryParty == poolOperator` on testnet. Under the mainnet 3-of-4 model it's a
+> threshold-gated ceremony — see memory `poolOperator-fund-safety-3of4`.
 
 All admin write endpoints resolve the current contract CID server-side and re-point the pool after
 consuming choices (`UpdateAssetReserveCid` / `UpdateOracleCid`) — the new UI doesn't manage CIDs for
@@ -221,8 +249,39 @@ stale/mismatched SDK versions.
 - **Int/Decimal must be JSON strings**; `Optional` null/value; `TextMap` = object.
 - **Consuming choices churn CIDs** (no contract keys). Every admin write re-points the pool; user actions
   re-resolve via `fetchLiveCids`.
-- **Ephemeral CC** needs `freshReserveHoldingCids` covering full liquidity (FIND-025); stable USDCx uses
-  the reserve's stored holdings.
+- **Ephemeral CC (pool side)** needs `freshReserveHoldingCids` covering full liquidity (FIND-025); stable
+  USDCx uses the reserve's stored holdings.
+- **Ephemeral CC (user side)** — `CONTRACT_NOT_FOUND` on CC supply/repay: the user's own CC holding
+  re-issued between fetch and submit. Re-fetch via `getFreshHoldings()` at submit + `withEphemeralRetry`.
+  (memory: `ephemeral-cc-user-holding-race`.) **The server is blind to user wallet holdings** (queries as
+  operator) — read them via the Loop provider, not the server.
+- **New-user `"UserPosition does not belong to this user"`** — a per-user query that falls back to *all*
+  users' data when the party has none hands a new wallet a stranger's CID. Never fall back; empty = empty.
+  (memory: `new-user-foreign-userposition`.) New users must `InitializeUserPosition` first.
+- **`"Stored price is stale"`** on any HF-checking op (disable-collateral, borrow, withdraw-with-debt,
+  liquidate) → the manual oracle price aged out; re-`set-price` to refresh the timestamp, then act
+  promptly. (Gone once the Phase-2 oracle bot pushes continuously.)
+- **Full repay leaves dust** — a *partial* repay short of the exact accrued debt leaves a residual borrow
+  that blocks disable/withdraw; use the full-repay path (`repayAmount = null`) to archive it. Display dust
+  with `fmtBalance` so `0.0000` never hides a real balance.
+- **Bad-debt write-off of the LAST borrower in a reserve** currently fails with a DAR 1e-10 underflow
+  (rounding) — needs a DAR fix. (memory: `bad-debt-writeoff-1e10-underflow`.)
+- **Never show a non-zero value as zero.** Two bugs came from this: token amounts (`0.0000 CC` hiding real
+  dust) and USD (`$0.001` → `$0.00`, which also made HF read `--`). Use `fmtBalance` / `fmtUsd` — both
+  render `< 0.0001` rather than lying.
+- **HF must show whenever there is ANY debt** — a `borrowedUSD > 0.01` guard both hid real debt and
+  diverged from the DAR (which computes HF for any non-zero debt). All guards are now `> 0`.
+- **Anything that bumps `scaledTotalSupplied` MUST create a backing position.** Real supplies and the
+  migration do; the old `seed-cc-liquidity` (a test shortcut calling `RecordDeposit` standalone) did not →
+  a phantom supplier claim. Run `GET /admin/solvency` after any bulk/unusual write. (memory:
+  `solvency-invariant-checker`.)
+- **`UserPosition` has `signatory user`** (operator is only an observer) → a user can `Archive` their own
+  registry via Loop, no operator involvement. Safe **only** on an EMPTY registry — archiving a populated
+  one orphans its Deposit/Borrow positions (they survive but are unreachable without the registry CID).
+  Handy for turning a used test wallet back into a clean migration candidate.
+- **Reserve-mutating choices are all `controller poolOperator`** (`Record*`, `AccrueInterest`,
+  `RefreshHoldings`) — a user can't call them directly; the only user-reachable path (SupplyTS etc.)
+  welds the accounting change to a real token transfer. No "inflate my balance" path exists.
 - **SCU / amulet version drift** — the participant must have the DAR uploaded + vetted; keep the amulet
   DAR version pinned.
 - **~1% USDCx fee gap** — bridged USDCx transfers net less than booked; reconcile with refresh-holdings /

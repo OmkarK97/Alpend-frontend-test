@@ -71,6 +71,10 @@ export interface PositionData {
   assetInfo: Record<string, { price: number; ltv: number; liqThreshold: number }>;
   walletBalance: string;
   ccWalletBalance: string;
+  /** True while the Loop wallet is still returning holdings. Tracked separately from
+   *  `loading` because the wallet call is several seconds slower than our own server —
+   *  only the balance cells wait on it, not the whole dashboard. */
+  holdingsLoading: boolean;
 
   // Per-asset breakdowns
   usdcxSupplied: string;

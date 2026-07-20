@@ -55,8 +55,8 @@ export function WithdrawModal({
   const effectiveWithdraw = fullWithdraw
     ? (borrowedUSD > 0 ? Math.min(supplied, maxSafeWithdraw) : supplied)
     : parseFloat(amount) || 0;
-  const currentHF = borrowedUSD > 0.01 ? liqThreshUSD / borrowedUSD : null;
-  const projectedHF = borrowedUSD > 0.01
+  const currentHF = borrowedUSD > 0 ? liqThreshUSD / borrowedUSD : null;
+  const projectedHF = borrowedUSD > 0
     ? Math.max(0, liqThreshUSD - effectiveWithdraw * info.price * info.liqThreshold) / borrowedUSD
     : null;
 
@@ -152,7 +152,7 @@ export function WithdrawModal({
         <div className="modal-balance">{fmtBalance(supplied)} {cfg.symbol}</div>
       </div>
 
-      {borrowedUSD > 0.01 && (
+      {borrowedUSD > 0 && (
         <div className="modal-field">
           <label className="modal-label">Max Safe Withdrawal (keeps HF ≥ 1)</label>
           <div className="modal-balance-sm">{fmtBalance(maxSafeWithdraw)} {cfg.symbol}</div>
@@ -191,7 +191,7 @@ export function WithdrawModal({
         </div>
       )}
 
-      {borrowedUSD > 0.01 && (
+      {borrowedUSD > 0 && (
         <HealthFactorPreview current={currentHF} projected={projectedHF} showProjected={effectiveWithdraw > 0} />
       )}
 

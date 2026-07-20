@@ -39,6 +39,9 @@ export function usePosition(
   >({});
   const [walletBalance, setWalletBalance] = useState('0.00');
   const [loading, setLoading] = useState(false);
+  // Separate from `loading`: wallet holdings come from the Loop wallet and land several
+  // seconds after our own server data, so they must not gate the whole dashboard.
+  const [holdingsLoading, setHoldingsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasUserPosition, setHasUserPosition] = useState(false);
   const fetched = useRef(false);
@@ -280,8 +283,11 @@ export function usePosition(
     if (!initialLoadDone.current) setLoading(true);
     setError(null);
 
-    // Fetch all holdings from Loop SDK (returns both USDCx and CC)
-    const holdingsPromise = fetchHoldings();
+    // Fetch all holdings from Loop SDK (returns both USDCx and CC).
+    // This is the slowest leg by far (~3-4s vs ~1s for our own server), so it gets its
+    // own loading flag and is deliberately NOT part of the `loading` gate below.
+    setHoldingsLoading(true);
+    const holdingsPromise = fetchHoldings().finally(() => setHoldingsLoading(false));
 
     // Fetch position data from backend
     try {
@@ -516,7 +522,7 @@ export function usePosition(
       setTotalLiqThresholdCollateralUSD(liqThreshUSD.toFixed(2));
       setTotalBorrowed(borrowedUSD.toFixed(2));
       setHealthFactor(
-        borrowedUSD > 0.01 && liqThreshUSD > 0
+        borrowedUSD > 0 && liqThreshUSD > 0
           ? (liqThreshUSD / borrowedUSD).toFixed(2)
           : null
       );
@@ -527,10 +533,16 @@ export function usePosition(
       );
     }
 
-    // Wait for holdings to finish too
-    await holdingsPromise;
+    // Server data is in — drop the skeleton now. Everything on the dashboard except the
+    // wallet-balance cells is derived from the fetches above; blocking all of it on the
+    // Loop wallet call was what made first paint take 4-5s instead of ~1s. The balance
+    // cells shimmer on `holdingsLoading` until the wallet answers.
     setLoading(false);
     initialLoadDone.current = true;
+
+    // Still await holdings before resolving, so callers that refresh-then-read holdings
+    // (e.g. after a supply/repay) keep the "everything has settled" guarantee they rely on.
+    await holdingsPromise;
   }, [partyId, provider, fetchHoldings]);
 
   useEffect(() => {
@@ -565,6 +577,7 @@ export function usePosition(
     assetInfo,
     walletBalance,
     ccWalletBalance,
+    holdingsLoading,
     usdcxSupplied,
     usdcxBorrowed,
     ccSupplied,

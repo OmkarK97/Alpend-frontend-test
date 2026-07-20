@@ -3,6 +3,7 @@ import { useLoop } from './hooks/useLoop';
 import { usePosition } from './hooks/usePosition';
 import { ConnectWallet } from './components/ConnectWallet';
 import { Dashboard } from './components/Dashboard';
+import { DashboardSkeleton } from './components/DashboardSkeleton';
 import { AdminPage } from './components/AdminPage';
 import { TransferPage } from './components/TransferPage';
 import { LiquidationsPage } from './components/LiquidationsPage';
@@ -13,6 +14,7 @@ export default function App() {
     provider,
     partyId,
     isConnecting,
+    isRestoring,
     isConnected,
     connect,
     disconnect,
@@ -72,7 +74,8 @@ export default function App() {
         <div className="header-right">
           <ConnectWallet
             isConnected={isConnected}
-            isConnecting={isConnecting}
+            // Show the header as "connecting" while restoring too, so it doesn't flash "Connect".
+            isConnecting={isConnecting || isRestoring}
             partyId={partyId}
             onConnect={connect}
             onDisconnect={disconnect}
@@ -83,6 +86,11 @@ export default function App() {
       <main className="app-main">
         {isTransfer ? (
           <TransferPage partyId={partyId} />
+        ) : isRestoring && !isConnected ? (
+          // Session restore in flight (autoConnect is async). Show the dashboard's own shape
+          // filling in rather than flashing a "not connected" prompt at someone who IS —
+          // it becomes the real dashboard the moment the session restores.
+          <DashboardSkeleton />
         ) : !isConnected ? (
           <div className="connect-prompt">
             <div className="connect-prompt-card">

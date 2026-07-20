@@ -57,10 +57,14 @@ export function fmtBalance(v: number | string, dp = 4): string {
   return n.toFixed(dp);
 }
 
-/** USD currency. Sub-$1 prices get more precision. */
+/** USD currency. Sub-$1 values get more precision, and — like fmtBalance — a NON-ZERO value
+ *  never renders as "$0.00": tiny amounts show as "<$0.0001" so a real debt/balance is never
+ *  displayed as nothing. */
 export function fmtUsd(v: number | string): string {
   const n = typeof v === 'string' ? parseFloat(v) : v;
-  if (!isFinite(n)) return '$0.00';
-  const dp = n !== 0 && Math.abs(n) < 1 ? 4 : 2;
+  if (!isFinite(n) || n === 0) return '$0.00';
+  const dp = Math.abs(n) < 1 ? 4 : 2;
+  const eps = Math.pow(10, -dp);
+  if (Math.abs(n) < eps) return `${n < 0 ? '> -$' : '< $'}${eps.toFixed(dp)}`;
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
 }

@@ -78,7 +78,7 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
   const projectedHF = projectedBorrowedUSD > 0
     ? liqThresholdUSD / projectedBorrowedUSD
     : null;
-  const currentHF = borrowedUSD > 0.01
+  const currentHF = borrowedUSD > 0
     ? liqThresholdUSD / borrowedUSD
     : null;
   const utilizationPct = weightedCollateralUSD > 0

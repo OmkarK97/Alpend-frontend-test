@@ -1896,3 +1896,7 @@ details summary {
 }
 .btn-collateral-toggle:hover:not(:disabled) { background: rgba(255,255,255,0.09); }
 .btn-collateral-toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Migration banner list */
+.migration-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.migration-list li { font-size: 0.85rem; color: #c9d1d9; }

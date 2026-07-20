@@ -46,6 +46,16 @@ export function connectLoop() {
   loop.connect();
 }
 
+/** Restore a previously-approved session (the SDK persists it to localStorage) so a page
+ *  refresh doesn't force the user to reconnect. On success it fires the SAME `onAccept`
+ *  callback passed to initLoop, so the normal connect path handles it.
+ *
+ *  Throws when there's no stored/valid session — that's the ordinary "first visit" case, so
+ *  callers should swallow it rather than surface an error. */
+export function autoConnectLoop(): Promise<void> {
+  return loop.autoConnect();
+}
+
 export function logoutLoop() {
   loop.logout();
 }

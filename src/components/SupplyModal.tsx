@@ -40,8 +40,8 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
   const borrowedUSD = parseFloat(position.totalBorrowed);
   const liqThreshUSD = parseFloat(position.totalLiqThresholdCollateralUSD);
   const inputAmount = parseFloat(amount) || 0;
-  const currentHF = borrowedUSD > 0.01 ? liqThreshUSD / borrowedUSD : null;
-  const projectedHF = borrowedUSD > 0.01
+  const currentHF = borrowedUSD > 0 ? liqThreshUSD / borrowedUSD : null;
+  const projectedHF = borrowedUSD > 0
     ? (liqThreshUSD + (enableAsCollateral ? inputAmount * info.price * info.liqThreshold : 0)) / borrowedUSD
     : null;
 
@@ -164,7 +164,7 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
         </label>
       </div>
 
-      {borrowedUSD > 0.01 && (
+      {borrowedUSD > 0 && (
         <HealthFactorPreview current={currentHF} projected={projectedHF} showProjected={inputAmount > 0} />
       )}
 

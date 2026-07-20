@@ -4,8 +4,11 @@ import type { PositionData, TransactionLog as TxLog, DepositPosition } from '../
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { buildInitializeUserPositionCommand } from '../commands/pool';
 import { buildEnableCollateralCommand, buildDisableCollateralCommand } from '../commands/collateral';
+import { buildArchiveUserPositionCommand } from '../commands/migration';
 import { fetchPoolDisclosedContracts, fetchLiveCids, poolCidFromDisclosed } from '../utils/transferContext';
-import { fmtBalance } from '../utils/format';
+import { fmtBalance, fmtUsd } from '../utils/format';
+import { DashboardSkeleton } from './DashboardSkeleton';
+import { MigrationBanner } from './MigrationBanner';
 import { SupplyModal } from './SupplyModal';
 import { BorrowModal } from './BorrowModal';
 import { WithdrawModal } from './WithdrawModal';
@@ -41,10 +44,11 @@ interface Props {
   logs: TxLog[];
 }
 
+// Dust-safe: a real-but-tiny value must never render as "$0.00" (e.g. 0.1 CC at $0.01 = $0.001).
 function formatUSD(value: string): string {
   const num = parseFloat(value);
   if (isNaN(num)) return '$0.00';
-  return `$${num.toFixed(2)}`;
+  return fmtUsd(num);
 }
 
 export function Dashboard({
@@ -57,6 +61,29 @@ export function Dashboard({
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [initLoading, setInitLoading] = useState(false);
   const [togglingCid, setTogglingCid] = useState<string | null>(null);
+  const [resetting, setResetting] = useState(false);
+
+  // TEST-ONLY: archive an EMPTY UserPosition so this wallet can be migrated fresh.
+  // Guarded on "no live positions" — archiving a populated registry would orphan its
+  // Deposit/Borrow positions (they'd survive but be unreachable without the registry CID).
+  const canResetRegistry =
+    position.hasUserPosition &&
+    position.depositPositions.length === 0 &&
+    position.borrowPositions.length === 0;
+
+  const handleResetRegistry = async () => {
+    if (!position.userPositionCid) return;
+    setResetting(true);
+    try {
+      const cmd = buildArchiveUserPositionCommand(position.userPositionCid);
+      await submitTx('ArchiveUserPosition', cmd, 'Reset position registry (test)', { estimateTraffic: false });
+      await position.refresh();
+    } catch (err) {
+      addLog('ArchiveUserPosition', 'error', `Failed: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      setResetting(false);
+    }
+  };
 
   // Enable/disable a supply position as collateral. No token transfer; DisableCollateral
   // re-checks HF >= 1 on-chain (so it needs the OTHER reserves for the basket).
@@ -130,31 +157,7 @@ export function Dashboard({
 
   if (position.loading) {
     return (
-      <div className="dashboard">
-        <div className="stat-cards">
-          {[0, 1, 2, 3].map((i) => (
-            <div className="stat-card" key={i}>
-              <span className="stat-label"><span className="skeleton skeleton-text" style={{ width: '50%' }} /></span>
-              <span className="stat-value"><span className="skeleton skeleton-value" /></span>
-            </div>
-          ))}
-        </div>
-        <div className="asset-section">
-          <div className="section-header">
-            <h2>Markets</h2>
-          </div>
-          <div className="asset-table">
-            <div className="asset-table-header">
-              <span>Asset</span>
-              <span>Wallet Balance</span>
-              <span>Supplied</span>
-              <span>Borrowed</span>
-              <span>Actions</span>
-            </div>
-            <div className="skeleton skeleton-row" style={{ marginTop: 8 }} />
-          </div>
-        </div>
-      </div>
+      <DashboardSkeleton />
     );
   }
 
@@ -207,7 +210,31 @@ export function Dashboard({
         </div>
       </div>
 
-      {/* Initialize Position Banner */}
+      {/* Migration prompt — shows if the operator prepared a snapshot for this wallet */}
+      <MigrationBanner
+        partyId={partyId}
+        submitTx={submitTx}
+        onDone={position.refresh}
+        addLog={addLog}
+      />
+
+      {/* TEST-ONLY: reset an empty registry so this wallet can be migrated fresh. Not for production. */}
+      {canResetRegistry && (
+        <div className="init-banner">
+          <div className="init-banner-content">
+            <h3>Reset position registry (test only)</h3>
+            <p>
+              Your registry is empty, so archiving it is safe — it lets this wallet be migrated fresh.
+              Test-only; this is not part of the real user flow.
+            </p>
+          </div>
+          <button className="btn-connect-large" onClick={handleResetRegistry} disabled={resetting}>
+            {resetting ? 'Resetting…' : 'Reset Registry'}
+          </button>
+        </div>
+      )}
+
+      {/* Initialize Position Banner (hidden while a migration is pending is a future nicety) */}
       {!position.hasUserPosition && position.poolCid && (
         <div className="init-banner">
           <div className="init-banner-content">
@@ -258,7 +285,9 @@ export function Dashboard({
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {fmtBalance(position.walletBalance)}
+                {position.holdingsLoading
+                  ? <span className="skeleton skeleton-text" style={{ width: '4rem' }} />
+                  : fmtBalance(position.walletBalance)}
               </span>
               <span className="cell-label">USDCx</span>
             </div>
@@ -328,7 +357,9 @@ export function Dashboard({
             </div>
             <div className="asset-cell">
               <span className="cell-value">
-                {fmtBalance(position.ccWalletBalance)}
+                {position.holdingsLoading
+                  ? <span className="skeleton skeleton-text" style={{ width: '4rem' }} />
+                  : fmtBalance(position.ccWalletBalance)}
               </span>
               <span className="cell-label">CC</span>
             </div>

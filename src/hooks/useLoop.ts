@@ -3,6 +3,7 @@ import { PaymentRequiredError } from '@fivenorth/loop-sdk';
 import {
   initLoop,
   connectLoop,
+  autoConnectLoop,
   logoutLoop,
   type LoopProvider,
   type RunTransactionResponse,
@@ -45,6 +46,9 @@ export function useLoop() {
   const [provider, setProvider] = useState<LoopProvider | null>(null);
   const [partyId, setPartyId] = useState<string>('');
   const [isConnecting, setIsConnecting] = useState(false);
+  // True until the initial autoConnect settles — prevents flashing the Connect prompt
+  // on refresh before we know whether a stored session can be restored.
+  const [isRestoring, setIsRestoring] = useState(true);
   const [logs, setLogs] = useState<TransactionLog[]>([]);
   const initialized = useRef(false);
   // Capture the latest update_id from onTransactionUpdate callback
@@ -117,6 +121,17 @@ export function useLoop() {
         }
       },
     });
+
+    // Restore a previously-approved session so a refresh doesn't force a reconnect.
+    // The SDK persists the session to localStorage; autoConnect rebuilds the provider from it
+    // and fires the onAccept above. It THROWS when there's no stored session (normal first
+    // visit) or the session lost its ticket auth — both mean "just show Connect", not an error.
+    // `isRestoring` gates the UI so we don't flash the Connect prompt before we know.
+    autoConnectLoop()
+      .catch(() => {
+        /* no restorable session — user connects manually */
+      })
+      .finally(() => setIsRestoring(false));
   }, [addLog]);
 
   const connect = useCallback(() => {
@@ -216,6 +231,7 @@ export function useLoop() {
     provider,
     partyId,
     isConnecting,
+    isRestoring,
     isConnected: !!provider,
     connect,
     disconnect,

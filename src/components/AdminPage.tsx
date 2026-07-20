@@ -1,6 +1,7 @@
 import type { LoopProvider, TransactionPayload } from '../loop/provider';
 import { useAdminData } from '../hooks/useAdminData';
 import { AdminOverview } from './admin/AdminOverview';
+import { SolvencyPanel } from './admin/SolvencyPanel';
 import { ManageAssets } from './admin/ManageAssets';
 import { PauseControls } from './admin/PauseControls';
 import { CollapsibleSection } from './admin/CollapsibleSection';
@@ -37,6 +38,7 @@ export function AdminPage({ partyId, provider, submitTx, addLog }: Props) {
       </div>
 
       <AdminOverview data={data} />
+      <SolvencyPanel />
       <ManageAssets data={data} />
       <PauseControls data={data} />
 

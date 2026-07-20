@@ -42,8 +42,8 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
   const liqThreshUSD = parseFloat(position.totalLiqThresholdCollateralUSD);
   const repayAmt = fullRepay ? borrowed : parseFloat(amount) || 0;
   const newBorrowedUSD = Math.max(0, borrowedUSD - repayAmt * info.price);
-  const currentHF = borrowedUSD > 0.01 ? liqThreshUSD / borrowedUSD : null;
-  const projectedHF = newBorrowedUSD > 0.01 ? liqThreshUSD / newBorrowedUSD : null;
+  const currentHF = borrowedUSD > 0 ? liqThreshUSD / borrowedUSD : null;
+  const projectedHF = newBorrowedUSD > 0 ? liqThreshUSD / newBorrowedUSD : null;
 
   const handleSubmit = async () => {
     if (!fullRepay && (!amount || parseFloat(amount) <= 0)) return;
@@ -159,7 +159,7 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
         </div>
       )}
 
-      {borrowedUSD > 0.01 && (
+      {borrowedUSD > 0 && (
         <HealthFactorPreview current={currentHF} projected={projectedHF} showProjected={repayAmt > 0} />
       )}
 
