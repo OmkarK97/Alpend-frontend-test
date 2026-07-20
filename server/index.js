@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { fetchSignedReport } from './chainlinkDataStreams.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1232,6 +1233,543 @@ app.post('/admin/write-off-bad-debt', async (req, res) => {
     res.json({ success: true, borrower, instrumentIdId, newReserveCid, newPoolCid, updateId: result.transaction?.updateId || result.updateId });
   } catch (e) {
     console.error('WRITE OFF BAD DEBT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** Exercise a consuming choice on the current PriceOracle, then re-point the pool at the new
+ *  oracle CID (Oracle choices churn the CID). Shared by set-verifier / register-feed / push-price. */
+async function exerciseOracleChoiceAndRepoint(choice, choiceArgument, actAs = [POOL_OPERATOR]) {
+  const ORACLE_TID = `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`;
+  const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+  // Target the oracle the POOL currently points at — NOT "last active oracle". After a
+  // rebuild-oracle there can be >1 active PriceOracle (the orphaned old one lingers), and
+  // picking the wrong one here would push prices to a stale oracle and repoint the pool back
+  // to it (re-introducing the manual-price shadow). The pool's oracleCid is authoritative.
+  const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+  const pool = pools[pools.length - 1];
+  const targetOracleCid = pool?.createArgument?.oracleCid;
+  const oracles = await queryContracts(ORACLE_TID, POOL_OPERATOR);
+  const oracle = oracles.find((o) => o.contractId === targetOracleCid) || oracles[oracles.length - 1];
+  if (!oracle?.contractId) throw new Error('No active PriceOracle found');
+
+  const result = await submitCommand([
+    { ExerciseCommand: { templateId: ORACLE_TID, contractId: oracle.contractId, choice, choiceArgument } },
+  ], actAs);
+  const newOracleCid = extractContractId(result);
+
+  let newPoolCid = null;
+  if (newOracleCid) {
+    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pool = pools[pools.length - 1];
+    if (pool?.contractId) {
+      const upd = await submitCommand([
+        { ExerciseCommand: { templateId: POOL_TID, contractId: pool.contractId, choice: 'UpdateOracleCid', choiceArgument: { newOracleCid } } },
+      ], [POOL_OPERATOR]);
+      newPoolCid = extractContractId(upd);
+    }
+  }
+  return { newOracleCid, newPoolCid, updateId: result.transaction?.updateId || result.updateId };
+}
+
+/** POST /admin/set-verifier — pin the canonical Chainlink Verifier + VerifierConfig (SetVerifier,
+ *  poolOperator). Body: { verifierCid, verifierConfigCid } (contract CIDs, from Chainlink). */
+app.post('/admin/set-verifier', async (req, res) => {
+  try {
+    const { verifierCid, verifierConfigCid } = req.body;
+    if (!verifierCid || !verifierConfigCid) {
+      return res.status(400).json({ success: false, error: 'verifierCid and verifierConfigCid are required' });
+    }
+    const out = await exerciseOracleChoiceAndRepoint('SetVerifier', {
+      newVerifierCid: verifierCid,
+      newVerifierConfigCid: verifierConfigCid,
+    });
+    console.log(`SetVerifier: oracle=${out.newOracleCid}, pool=${out.newPoolCid}`);
+    res.json({ success: true, ...out });
+  } catch (e) {
+    console.error('SET VERIFIER error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/register-feed — map a reserve's canonical priceFeedId → the raw Chainlink report.feedId
+ *  (RegisterFeed, poolOperator). Body: { label, rawFeedId }. e.g. label "cc-feed",
+ *  rawFeedId "0x0003111e1c2212376d4c196bf7635919e4b28368809dda6f515c396453d53770". */
+app.post('/admin/register-feed', async (req, res) => {
+  try {
+    const { label, rawFeedId } = req.body;
+    if (!label || !rawFeedId) {
+      return res.status(400).json({ success: false, error: 'label and rawFeedId are required' });
+    }
+    const out = await exerciseOracleChoiceAndRepoint('RegisterFeed', { label, rawFeedId });
+    console.log(`RegisterFeed: ${label} -> ${rawFeedId}, oracle=${out.newOracleCid}`);
+    res.json({ success: true, label, rawFeedId, ...out });
+  } catch (e) {
+    console.error('REGISTER FEED error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/push-price — fetch the latest signed Chainlink Data Streams report for a feed and push
+ *  it on-chain via UpdatePrice (oraclePusher; == poolOperator on testnet). Requires the verifier pinned
+ *  (set-verifier) + the feed registered (register-feed). Body: { feedId } (Chainlink feed id). */
+/** Fetch the latest signed report for a feed and push it on-chain via UpdatePrice. Reusable by
+ *  the manual endpoint + the continuous loop. Requires verifier pinned + feed registered. */
+async function pushFeed(feedId) {
+  const report = await fetchSignedReport(feedId);
+  // signedReportBytes is BytesHex — passed straight to the DAR, which verifies + decodes on-chain.
+  const out = await exerciseOracleChoiceAndRepoint('UpdatePrice', { signedReportBytes: report.fullReport }, [POOL_OPERATOR]);
+  return { feedId: report.feedId, decodedPrice: report.decoded?.price, ...out };
+}
+
+app.post('/admin/push-price', async (req, res) => {
+  try {
+    const { feedId } = req.body;
+    if (!feedId) return res.status(400).json({ success: false, error: 'feedId (Chainlink feed id) is required' });
+    const out = await pushFeed(feedId);
+    console.log(`PushPrice ${feedId}: price≈${out.decodedPrice}, oracle=${out.newOracleCid}`);
+    res.json({ success: true, ...out });
+  } catch (e) {
+    console.error('PUSH PRICE error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/rebuild-oracle — stand up a FRESH PriceOracle with `allowManualPrice=false` and
+ *  repoint the pool at it. This is the one-shot cure for the manual-price shadow: `resolvePrice`
+ *  checks the reserve's feed label directly BEFORE the alias, so any leftover manual `SetPrice`
+ *  stored under a label (`cc-feed`/`usdcx-feed`) permanently shadows the live Chainlink price
+ *  (stored under the raw feed id) — and once stale it BRICKS reads (GetPrice aborts, no fall-through).
+ *  The deployed Oracle has no RemovePrice choice, so we rebuild instead. `allowManualPrice=false`
+ *  means the fresh oracle can never acquire a label-keyed price, so reads resolve label→alias→raw→live.
+ *
+ *  Copies operator/pusher/staleness/verifier from the current oracle; takes feeds [{label, rawFeedId}].
+ *  CRITICAL: the alias value is stored with the `0x` prefix STRIPPED, because the DAR stores the price
+ *  under `report.feedId` in that exact form (no `0x`) — the alias value must byte-match that key or the
+ *  fallback lookup misses. Order: create (verifier+aliases baked in, prices empty) → UpdatePrice every
+ *  feed (so the new oracle carries a live price for each) → UpdateOracleCid ONCE (its FIND-014 check
+ *  requires a resolvable price for every configured reserve feed, so the repoint must come last). */
+app.post('/admin/rebuild-oracle', async (req, res) => {
+  try {
+    const ORACLE_TID = `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`;
+    const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+    const feeds = req.body.feeds;
+    if (!Array.isArray(feeds) || feeds.length === 0) {
+      return res.status(400).json({ success: false, error: 'feeds [{label, rawFeedId}] required' });
+    }
+
+    // Current pool + the oracle it points at (authoritative source for params to copy).
+    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pool = pools[pools.length - 1];
+    if (!pool?.contractId) throw new Error('No active LendingPool found');
+    const curOracleCid = pool.createArgument?.oracleCid;
+    const oracles = await queryContracts(ORACLE_TID, POOL_OPERATOR);
+    const cur = oracles.find((o) => o.contractId === curOracleCid) || oracles[oracles.length - 1];
+    if (!cur?.createArgument) throw new Error('Could not read current oracle params');
+    const c = cur.createArgument;
+    if (!c.pinnedVerifierCid || !c.pinnedVerifierConfigCid) {
+      throw new Error('Current oracle has no pinned verifier — run set-verifier first');
+    }
+
+    // Alias value MUST equal the DAR-stored price key (report.feedId, no 0x prefix).
+    const stripHex = (s) => (s.startsWith('0x') ? s.slice(2) : s);
+    const feedAliases = {};
+    for (const f of feeds) feedAliases[f.label] = stripHex(f.rawFeedId);
+
+    // 1. Fresh oracle: allowManualPrice=false, verifier + aliases baked in, prices empty.
+    const createRes = await submitCommand([
+      { CreateCommand: {
+        templateId: ORACLE_TID,
+        createArguments: {
+          poolOperator: c.poolOperator,
+          oraclePusher: c.oraclePusher,
+          prices: {},
+          pendingPrices: {},
+          feedAliases,
+          maxStalenessSeconds: c.maxStalenessSeconds,
+          liquidationMaxStalenessSeconds: c.liquidationMaxStalenessSeconds,
+          maxDeviationBps: c.maxDeviationBps,
+          allowManualPrice: false,
+          pinnedVerifierCid: c.pinnedVerifierCid,
+          pinnedVerifierConfigCid: c.pinnedVerifierConfigCid,
+        },
+      } },
+    ], [POOL_OPERATOR]);
+    let oracleCid = extractContractId(createRes);
+    if (!oracleCid) throw new Error('Fresh oracle create returned no contract id');
+
+    // 2. Push each feed's live price. UpdatePrice churns the oracle cid → chain it.
+    const pushed = [];
+    for (const f of feeds) {
+      const report = await fetchSignedReport(f.rawFeedId);
+      const upd = await submitCommand([
+        { ExerciseCommand: {
+          templateId: ORACLE_TID, contractId: oracleCid,
+          choice: 'UpdatePrice', choiceArgument: { signedReportBytes: report.fullReport },
+        } },
+      ], [POOL_OPERATOR]);
+      oracleCid = extractContractId(upd);
+      pushed.push({ label: f.label, storedFeedId: report.feedId, price: report.decoded?.price });
+    }
+
+    // 3. Repoint the pool ONCE, now that the fresh oracle carries a price for every feed.
+    const poolsNow = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const poolNow = poolsNow[poolsNow.length - 1];
+    const rep = await submitCommand([
+      { ExerciseCommand: {
+        templateId: POOL_TID, contractId: poolNow.contractId,
+        choice: 'UpdateOracleCid', choiceArgument: { newOracleCid: oracleCid },
+      } },
+    ], [POOL_OPERATOR]);
+    const newPoolCid = extractContractId(rep);
+
+    console.log(`RebuildOracle: fresh oracle=${oracleCid} (allowManualPrice=false), pool=${newPoolCid}`);
+    res.json({ success: true, newOracleCid: oracleCid, newPoolCid, allowManualPrice: false, feedAliases, pushed });
+  } catch (e) {
+    console.error('REBUILD ORACLE error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* ---- Continuous oracle push loop (the oracle bot) --------------------------
+ * Pushes each configured feed on an interval. Off by default; start it via the endpoint
+ * AFTER the verifier is pinned + feeds registered (else every cycle aborts "no pinned verifier").
+ * A "not newer than stored price" abort is a benign skip (the feed hasn't published a newer report). */
+// TESTNET Data Streams feed ids (differ from mainnet). The mainnet ids return "report not found"
+// against the testnet host — see chainlink-byo-verifier notes.
+const DEFAULT_FEEDS = {
+  'cc-feed': '0x00031de3179f870b857f273a3496c5a76795aec28f984f243b51fd8aaf759c55',
+  'usdcx-feed': '0x0003dc85e8b01946bf9dfd8b0db860129181eb6105a8c8981d9f28e00b6f60d9',
+};
+const oraclePush = { enabled: false, intervalMs: 120000, feeds: Object.values(DEFAULT_FEEDS), timer: null, last: {}, running: false };
+
+async function runOraclePushCycle() {
+  if (oraclePush.running) return; // don't overlap cycles
+  oraclePush.running = true;
+  try {
+    for (const feedId of oraclePush.feeds) {
+      try {
+        const out = await pushFeed(feedId);
+        oraclePush.last[feedId] = { ok: true, price: out.decodedPrice, at: new Date().toISOString() };
+        console.log(`[oracle-loop] ${feedId} -> ${out.decodedPrice}`);
+      } catch (e) {
+        const benign = /not newer than the stored price/i.test(e.message);
+        oraclePush.last[feedId] = { ok: benign, skipped: benign, error: e.message, at: new Date().toISOString() };
+        console.warn(`[oracle-loop] ${feedId} ${benign ? 'skip (no newer report)' : 'FAILED: ' + e.message}`);
+      }
+    }
+  } finally {
+    oraclePush.running = false;
+  }
+}
+
+function startOraclePush(intervalMs, feeds) {
+  if (oraclePush.timer) clearInterval(oraclePush.timer);
+  if (intervalMs) oraclePush.intervalMs = intervalMs;
+  if (Array.isArray(feeds) && feeds.length) oraclePush.feeds = feeds;
+  oraclePush.enabled = true;
+  runOraclePushCycle();
+  oraclePush.timer = setInterval(runOraclePushCycle, oraclePush.intervalMs);
+}
+function stopOraclePush() {
+  if (oraclePush.timer) clearInterval(oraclePush.timer);
+  oraclePush.timer = null;
+  oraclePush.enabled = false;
+}
+
+app.post('/admin/oracle-push/start', (req, res) => {
+  const { intervalMs, feeds } = req.body || {};
+  startOraclePush(intervalMs, feeds);
+  res.json({ success: true, enabled: true, intervalMs: oraclePush.intervalMs, feeds: oraclePush.feeds });
+});
+app.post('/admin/oracle-push/stop', (req, res) => {
+  stopOraclePush();
+  res.json({ success: true, enabled: false });
+});
+app.get('/admin/oracle-push/status', (req, res) => {
+  res.json({ success: true, enabled: oraclePush.enabled, intervalMs: oraclePush.intervalMs, feeds: oraclePush.feeds, last: oraclePush.last });
+});
+
+/** POST /admin/create-migration-snapshot — operator prepares a per-user MigrationSnapshot from
+ *  (mock or real) legacy data. Operator-signed, user-observer; the user later accepts it with one
+ *  Loop signature (MigrationAccept). No tokens move — the treasury already holds them.
+ *  Body: { user, collaterals:[{instrumentIdId, realizedPrincipal, isUsedAsCollateral?}],
+ *          borrows:[{instrumentIdId, realizedDebt}], expiresInDays? }. */
+app.post('/admin/create-migration-snapshot', async (req, res) => {
+  try {
+    const { user, collaterals = [], borrows = [], expiresInDays = 90, allowExistingRegistry = false } = req.body;
+    if (!user) return res.status(400).json({ success: false, error: 'user party is required' });
+    if (collaterals.length === 0 && borrows.length === 0) {
+      return res.status(400).json({ success: false, error: 'need at least one collateral or borrow entry' });
+    }
+
+    // NEW-03 (MANDATORY backend invariant): the DAR cannot enforce one-registry-per-user
+    // (UserPosition is keyless by design), so MigrationAccept would happily create a SECOND
+    // registry. A non-canonical duplicate causes CID-mismatch failures for that user forever.
+    // Refuse to issue a snapshot for anyone who already has a UserPosition — whether from a
+    // prior migration or InitializeUserPosition. See Lending/Migration.daml NEW-03.
+    if (!allowExistingRegistry) {
+      const existing = await queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR);
+      const mine = existing.filter((u) => u.createArgument?.user === user);
+      if (mine.length > 0) {
+        return res.status(409).json({
+          success: false,
+          error: `Refusing to snapshot: user already has ${mine.length} UserPosition registry (${mine.map((m) => m.contractId.slice(0, 16)).join(', ')}). ` +
+            `Accepting would create a SECOND registry (NEW-03). Resolve the existing registry first.`,
+        });
+      }
+    }
+
+    // Resolve each asset's full instrumentId (admin + id) from the live reserves.
+    const reserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
+    const instrById = {};
+    for (const r of reserves) {
+      const iid = r.createArgument?.instrumentId;
+      if (iid?.id) instrById[iid.id] = iid;
+    }
+    const resolve = (instrumentIdId) => {
+      const iid = instrById[instrumentIdId];
+      if (!iid) throw new Error(`No reserve/instrument found for "${instrumentIdId}"`);
+      return { admin: iid.admin, id: iid.id };
+    };
+
+    const snapCollaterals = collaterals.map((c) => ({
+      instrumentId: resolve(c.instrumentIdId),
+      realizedPrincipal: String(c.realizedPrincipal),
+      isUsedAsCollateral: c.isUsedAsCollateral ?? true,
+    }));
+    const snapBorrows = borrows.map((b) => ({
+      instrumentId: resolve(b.instrumentIdId),
+      realizedDebt: String(b.realizedDebt),
+    }));
+    const expiresAt = new Date(Date.now() + expiresInDays * 86400000).toISOString();
+
+    const result = await submitCommand([
+      {
+        CreateCommand: {
+          templateId: `#alpend-lending-final-loop:Lending.Migration:MigrationSnapshot`,
+          createArguments: {
+            poolOperator: POOL_OPERATOR,
+            user,
+            collaterals: snapCollaterals,
+            borrows: snapBorrows,
+            expiresAt,
+          },
+        },
+      },
+    ], [POOL_OPERATOR]);
+
+    const snapshotCid = extractContractId(result);
+    console.log(`MigrationSnapshot created for ${user.slice(0, 16)}: ${snapshotCid}`);
+    res.json({
+      success: true,
+      snapshotCid,
+      user,
+      collaterals: snapCollaterals,
+      borrows: snapBorrows,
+      expiresAt,
+      updateId: result.transaction?.updateId || result.updateId,
+    });
+  } catch (e) {
+    console.error('CREATE MIGRATION SNAPSHOT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/cancel-migration-snapshot — operator cancels/cleans a snapshot (MigrationCancel).
+ *  Body: { snapshotCid }. */
+app.post('/admin/cancel-migration-snapshot', async (req, res) => {
+  try {
+    const { snapshotCid } = req.body;
+    if (!snapshotCid) return res.status(400).json({ success: false, error: 'snapshotCid is required' });
+    await submitCommand([
+      {
+        ExerciseCommand: {
+          templateId: `#alpend-lending-final-loop:Lending.Migration:MigrationSnapshot`,
+          contractId: snapshotCid,
+          choice: 'MigrationCancel',
+          choiceArgument: {},
+        },
+      },
+    ], [POOL_OPERATOR]);
+    res.json({ success: true, cancelled: snapshotCid });
+  } catch (e) {
+    console.error('CANCEL MIGRATION SNAPSHOT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** GET /admin/migration-snapshot/:party — return the (unaccepted) MigrationSnapshot for a user,
+ *  so the frontend can show the accept prompt. */
+app.get('/admin/migration-snapshot/:party', async (req, res) => {
+  try {
+    const snaps = await queryContracts(`#alpend-lending-final-loop:Lending.Migration:MigrationSnapshot`, POOL_OPERATOR);
+    const mine = snaps.filter((s) => s.createArgument?.user === req.params.party);
+    res.json({ success: true, snapshots: mine });
+  } catch (e) {
+    console.error('QUERY MIGRATION SNAPSHOT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** GET /admin/solvency — protocol invariant sweep. For each reserve, checks the four core
+ *  accounting invariants against the CURRENT ledger state (which already reflects the full
+ *  history of supplies/borrows/liquidations/write-off/unification/revenue). Any FAIL is a real
+ *  accounting/DAR bug. Tolerance absorbs sub-dust Decimal rounding. */
+app.get('/admin/solvency', async (req, res) => {
+  try {
+    const P = `#alpend-lending-final-loop:Lending.`;
+    const [reserveC, depositC, borrowC, holdingC] = await Promise.all([
+      queryContracts(`${P}AssetReserve:AssetReserve`, POOL_OPERATOR),
+      queryContracts(`${P}Deposit:DepositPosition`, POOL_OPERATOR),
+      queryContracts(`${P}Borrow:BorrowPosition`, POOL_OPERATOR),
+      queryContractsByInterface(HOLDING_INTERFACE, POOL_OPERATOR).catch(() => []),
+    ]);
+
+    const num = (x) => parseFloat(x || '0') || 0;
+    const holdingAmt = (c) =>
+      num(c.createArgument?.amount?.initialAmount ?? c.interfaceViews?.[0]?.viewValue?.amount ?? c.createArgument?.amount);
+    const holdingInstr = (c) =>
+      c.createArgument?.instrumentId?.id ?? c.interfaceViews?.[0]?.viewValue?.instrumentId?.id;
+
+    // sum the operator's real on-ledger holdings per instrument
+    const realHoldingsByInstr = {};
+    for (const c of holdingC) {
+      const id = holdingInstr(c);
+      if (id) realHoldingsByInstr[id] = (realHoldingsByInstr[id] || 0) + holdingAmt(c);
+    }
+
+    // ok within relative + absolute tolerance
+    const close = (a, b) => Math.abs(a - b) <= 1e-6 + 1e-8 * Math.max(Math.abs(a), Math.abs(b));
+    const geTol = (a, b) => a >= b - (1e-6 + 1e-8 * Math.max(Math.abs(a), Math.abs(b)));
+
+    const reserves = [];
+    let allPass = true;
+    for (const r of reserveC) {
+      const a = r.createArgument || {};
+      const id = a.instrumentId?.id;
+      if (!id) continue;
+      const liqIdx = num(a.liquidityIndex) || 1;
+      const borIdx = num(a.variableBorrowIndex) || 1;
+      const totalLiquidity = num(a.totalLiquidity);
+      const scaledSupplied = num(a.scaledTotalSupplied);
+      const scaledBorrowed = num(a.scaledTotalBorrowed);
+
+      const suppliersOwed = scaledSupplied * liqIdx;
+      const outstandingDebt = scaledBorrowed * borIdx;
+      const realHoldings = realHoldingsByInstr[id] || 0;
+      const realPoolEntitled = realHoldings + outstandingDebt;
+
+      // Σ accrued value of every deposit / borrow of this asset
+      let sumDeposits = 0;
+      for (const d of depositC) {
+        const da = d.createArgument || {};
+        if (da.instrumentId?.id !== id) continue;
+        sumDeposits += num(da.principal) * (liqIdx / (num(da.liquidityIndex) || 1));
+      }
+      let sumBorrows = 0;
+      for (const b of borrowC) {
+        const ba = b.createArgument || {};
+        if (ba.instrumentId?.id !== id) continue;
+        sumBorrows += num(ba.borrowedAmount) * (borIdx / (num(ba.borrowIndex) || 1));
+      }
+
+      const checks = {
+        // I1 — real solvency: real tokens + outstanding debt cover what suppliers are owed
+        realSolvency: { pass: geTol(realPoolEntitled, suppliersOwed), realPoolEntitled, suppliersOwed, margin: realPoolEntitled - suppliersOwed },
+        // I2 — supply consistency: Σ accrued deposits == scaledTotalSupplied × liquidityIndex
+        supplyConsistency: { pass: close(sumDeposits, suppliersOwed), sumDeposits, suppliersOwed, drift: sumDeposits - suppliersOwed },
+        // I3 — borrow consistency: Σ accrued borrows == scaledTotalBorrowed × variableBorrowIndex
+        borrowConsistency: { pass: close(sumBorrows, outstandingDebt), sumBorrows, outstandingDebt, drift: sumBorrows - outstandingDebt },
+        // I4 — books vs reality: reserve.totalLiquidity == real on-ledger holdings
+        booksVsReality: { pass: close(totalLiquidity, realHoldings), totalLiquidity, realHoldings, gap: totalLiquidity - realHoldings },
+      };
+      const pass = Object.values(checks).every((c) => c.pass);
+      if (!pass) allPass = false;
+      reserves.push({ instrument: id, pass, checks });
+    }
+
+    res.json({ success: true, allPass, reserves });
+  } catch (e) {
+    console.error('SOLVENCY error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/create-verifier — create OUR OWN Verifier instance (owner = poolOperator).
+ *  Chainlink runs a "bring-your-own-Verifier" model: the Verifier template is stateless and holds
+ *  no secrets (all security lives in the VerifierConfig, which Chainlink issues us as an observer),
+ *  so they never grant observer access to their Verifier — every party stands up its own. `Verify`
+ *  only does `fetch configCid` + reads the config's DON keys; it never checks that the Verifier and
+ *  VerifierConfig share an owner, so our poolOperator-owned Verifier + Chainlink's VerifierConfig
+ *  verifies fine. Pin the returned CID with set-verifier (paired with the Chainlink config CID). */
+app.post('/admin/create-verifier', async (req, res) => {
+  try {
+    const commands = [
+      {
+        CreateCommand: {
+          templateId: `#verifier:Verifier:Verifier`,
+          createArguments: {
+            owner: POOL_OPERATOR,
+            observers: [],
+          },
+        },
+      },
+    ];
+    const result = await submitCommand(commands, [POOL_OPERATOR]);
+    const verifierCid = extractContractId(result);
+    console.log(`Created Verifier: ${verifierCid} (owner=${POOL_OPERATOR})`);
+    res.json({
+      success: true,
+      verifierCid,
+      next: 'POST /admin/set-verifier { verifierCid, verifierConfigCid } — pair this with the Chainlink VerifierConfig CID (from oracle-verifier-contracts).',
+    });
+  } catch (e) {
+    console.error('CREATE VERIFIER error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** GET /admin/oracle-verifier-contracts — list the Verifier + VerifierConfig contracts our party
+ *  can see. NOTE: we create our OWN Verifier (see create-verifier) — it shows up here as owner. The
+ *  VerifierConfig is Chainlink's, visible because they granted POOL_OPERATOR observer access. If the
+ *  config side is empty, that observer grant is missing (or the template name differs). */
+app.get('/admin/oracle-verifier-contracts', async (req, res) => {
+  try {
+    const [verifiers, configs] = await Promise.all([
+      queryContracts(`#verifier:Verifier:Verifier`, POOL_OPERATOR).catch((e) => ({ __err: e.message })),
+      queryContracts(`#verifier-config:VerifierConfig:VerifierConfig`, POOL_OPERATOR).catch((e) => ({ __err: e.message })),
+    ]);
+    // Surface which config digests each VerifierConfig actually holds. `Verifier.Verify` looks the
+    // report's configDigest up in `verifierConfigStateView.verifierStates`; a digest missing here is
+    // the `DigestNotSet` abort (the DON config Chainlink populated doesn't cover our feeds' reports).
+    // `verifierStates : Map BytesHex VerifierConfigDigest` — DA.Map serializes as an array of
+    // [keyHex, valueObj] pairs (NOT a JSON object like TextMap), so read element [0] of each pair.
+    const configDetail = Array.isArray(configs)
+      ? configs.map((c) => {
+          const raw = c.createArgument?.verifierConfigStateView?.verifierStates ?? [];
+          const entries = Array.isArray(raw)
+            ? raw.map((pair) => ({ digest: pair[0], state: pair[1] }))
+            : Object.entries(raw).map(([digest, state]) => ({ digest, state }));
+          return {
+            contractId: c.contractId,
+            digestCount: entries.length,
+            digests: entries.map((e) => ({
+              configDigest: e.digest,
+              isActive: e.state?.isActive ?? null,
+              f: e.state?.f ?? null,
+            })),
+          };
+        })
+      : configs;
+    res.json({
+      success: true,
+      hint: 'verifiers = our own instance(s) from create-verifier. verifierConfigs = Chainlink-issued (needs their observer grant). `digests` = config digests the config covers; a report whose configDigest is absent fails UpdatePrice with DigestNotSet.',
+      verifiers: Array.isArray(verifiers) ? verifiers.map((c) => ({ contractId: c.contractId })) : verifiers,
+      verifierConfigs: configDetail,
+    });
+  } catch (e) {
+    console.error('ORACLE VERIFIER CONTRACTS error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
