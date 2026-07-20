@@ -157,7 +157,6 @@ export function usePosition(
       setWalletBalance(usdcx.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
       setCcHoldings(cc);
       setCcWalletBalance(cc.reduce((s, h) => s + parseFloat(h.amount), 0).toFixed(10));
-      console.log('Holdings split: USDCx:', usdcx.length, 'CC:', cc.length);
       return { usdcx, cc };
     };
 
@@ -171,11 +170,10 @@ export function usePosition(
         const loopResult = await provider.getActiveContracts({ interfaceId: iid });
         const allHoldings = parseAllHoldings(loopResult as unknown[]);
         if (allHoldings.length > 0) {
-          console.log('Strategy 1: got', allHoldings.length, 'total holdings via interfaceId', iid);
           return setHoldingsFromParsed(allHoldings);
         }
       } catch {
-        console.warn('Strategy 1 failed for interfaceId:', iid);
+        // this interface id isn't supported by the wallet — fall through to the next strategy
       }
     }
 
@@ -189,11 +187,10 @@ export function usePosition(
         const loopResult = await provider.getActiveContracts({ templateId: tid });
         const allHoldings = parseAllHoldings(loopResult as unknown[]);
         if (allHoldings.length > 0) {
-          console.log('Strategy 2: got', allHoldings.length, 'total holdings via templateId', tid);
           return setHoldingsFromParsed(allHoldings);
         }
       } catch {
-        console.warn('Strategy 2 failed for templateId:', tid);
+        // this template id isn't supported by the wallet — fall through to the next strategy
       }
     }
 
@@ -206,12 +203,6 @@ export function usePosition(
       });
 
       if (usdcxEntries.length > 0) {
-        // Log all keys so we can find where CIDs are stored
-        for (const entry of usdcxEntries) {
-          console.log('Strategy 3: USDCx entry keys:', Object.keys(entry as object));
-          console.log('Strategy 3: USDCx entry full:', JSON.stringify(entry, null, 2));
-        }
-
         const holdings: UsdcxHolding[] = usdcxEntries.map((h: unknown) => {
           const entry = h as Record<string, unknown>;
           // Try every plausible field name for contract IDs
@@ -259,17 +250,15 @@ export function usePosition(
           }));
           setUsdcxHoldings(cidsHoldings);
           setWalletBalance(total.toFixed(10));
-          console.log('Strategy 3: got', allCids.length, 'holding CIDs');
           return { usdcx: cidsHoldings.map((h) => ({ contractId: h.contractId, amount: h.amount, owner: partyId })), cc: [] };
         }
 
         // Got balance but no CIDs — show balance but holdings can't be used for tx
         setWalletBalance(total.toFixed(10));
-        console.warn('Strategy 3: got balance', total, 'but no contractIds — supply will not work');
-        console.warn('Strategy 3: Available fields were:', usdcxEntries.map((e) => Object.keys(e as object)));
+        console.warn('Wallet returned a balance but no holding contract ids — supply/repay will not work');
       }
     } catch {
-      console.warn('Strategy 3 (getHolding) also failed');
+      console.warn('All wallet holdings-fetch strategies failed');
     }
     return null;
   }, [provider, partyId]);

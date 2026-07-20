@@ -94,11 +94,8 @@ export function useLoop() {
         addLog('connect', 'error', 'Connection rejected by user');
       },
       onTransactionUpdate: (payload: RunTransactionResponse) => {
-        console.log('[useLoop] onTransactionUpdate fired:', JSON.stringify({ status: payload.status, update_id: payload.update_id, command_id: payload.command_id }, null, 2));
         const updateId = payload.update_id || extractUpdateId(payload);
-        console.log('[useLoop] extracted updateId from callback:', updateId);
         if (payload.status === 'failed') {
-          console.log('[useLoop] callback status=failed, NOT resolving promise');
           addLog(
             'tx-update',
             'error',
@@ -111,7 +108,6 @@ export function useLoop() {
           }
         } else {
           addLog('tx-update', 'success', `Update: ${updateId || payload.command_id}`, payload, updateId);
-          console.log('[useLoop] callback status=success, has pending resolve?', !!lastTxUpdateRef.current?.resolve);
           if (lastTxUpdateRef.current?.resolve) {
             lastTxUpdateRef.current.resolve(updateId || '');
             lastTxUpdateRef.current = { updateId: updateId || '' };
@@ -149,18 +145,15 @@ export function useLoop() {
   const submitTx = useCallback(
     async (operation: string, payload: TransactionPayload, message: string, options?: SubmitTxOptions) => {
       if (!provider) throw new Error('Not connected');
-      console.log('[submitTx] START operation:', operation, 'message:', message);
       addLog(operation, 'pending', `Submitting: ${message}`);
 
       // The Loop SDK's submitAndWaitForTransaction may never resolve —
       // the actual result comes via the onTransactionUpdate WebSocket callback.
       // Set up a promise that the callback will resolve, and race it against the SDK promise.
       const callbackPromise = new Promise<{ source: 'callback'; updateId: string }>((resolve) => {
-        console.log('[submitTx] setting up callback promise');
         lastTxUpdateRef.current = {
           updateId: '',
           resolve: (id: string) => {
-            console.log('[submitTx] callback promise RESOLVED with updateId:', id);
             resolve({ source: 'callback', updateId: id });
           },
         };
@@ -169,7 +162,6 @@ export function useLoop() {
       // Timeout: if neither resolves in 60s, give up
       const timeoutPromise = new Promise<{ source: 'timeout'; updateId: string }>((resolve) => {
         setTimeout(() => {
-          console.log('[submitTx] TIMEOUT after 60s');
           resolve({ source: 'timeout', updateId: '' });
         }, 60000);
       });
@@ -179,40 +171,31 @@ export function useLoop() {
         message,
         estimateTraffic: options?.estimateTraffic ?? true,
       }).then((result) => {
-        console.log('[submitTx] SDK promise RESOLVED, result type:', typeof result, 'keys:', result ? Object.keys(result as object) : 'null');
         return {
           source: 'sdk' as const,
           updateId: extractUpdateId(result) || '',
           result,
         };
-      }).catch((err) => {
-        console.log('[submitTx] SDK promise REJECTED:', err);
-        throw err;
       });
 
       try {
-        console.log('[submitTx] racing SDK vs callback vs timeout...');
         // Race: SDK resolution vs callback vs timeout
         const winner = await Promise.race([sdkPromise, callbackPromise, timeoutPromise]);
-        console.log('[submitTx] race winner:', winner.source, 'updateId:', winner.updateId);
 
         let txUpdateId = winner.updateId;
 
         // If SDK won but had no updateId, check if callback already fired
         if (!txUpdateId && lastTxUpdateRef.current?.updateId) {
           txUpdateId = lastTxUpdateRef.current.updateId;
-          console.log('[submitTx] got updateId from ref fallback:', txUpdateId);
         }
 
         if (winner.source === 'timeout') {
           throw new Error('Transaction timed out — check Activity log for status');
         }
 
-        console.log('[submitTx] SUCCESS, returning updateId:', txUpdateId);
         addLog(operation, 'success', `Completed: ${message}`, undefined, txUpdateId || undefined);
         return { _extractedUpdateId: txUpdateId };
       } catch (err) {
-        console.log('[submitTx] CATCH block, error:', err);
         // 0.12+ after-execution gas model: the SDK throws PaymentRequiredError (402)
         // when network gas is due. Surface a clear message rather than a raw 402.
         // (Paying it is a server-SDK concern — checkDueGas/payGas — not the client.)
