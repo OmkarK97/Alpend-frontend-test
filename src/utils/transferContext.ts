@@ -10,13 +10,16 @@ export interface TransferContext {
   disclosedContracts: DisclosedContract[];
 }
 
-/** True if the error is a ledger CONTRACT_NOT_FOUND (archived/stale contract). */
+/** True if the error is a stale/archived-contract ledger error that a fresh re-fetch would fix.
+ *  Covers BOTH CONTRACT_NOT_FOUND (the id isn't in the ACS) AND LOCAL_VERDICT_INACTIVE_CONTRACTS
+ *  (the id was live at build time but archived by the time of the verdict) — a Canton Coin holding
+ *  re-issuing mid-submit surfaces as either one. */
 export function isContractNotFound(e: unknown): boolean {
   const s = typeof e === 'string' ? e : (e as { message?: string })?.message || JSON.stringify(e ?? '');
-  return /CONTRACT_NOT_FOUND/i.test(s);
+  return /CONTRACT_NOT_FOUND|INACTIVE_CONTRACTS/i.test(s);
 }
 
-/** Run `fn`; if it fails with CONTRACT_NOT_FOUND on an ephemeral asset (Canton Coin holdings
+/** Run `fn`; if it fails with a stale-contract error on an ephemeral asset (Canton Coin holdings
  *  re-issue on round boundaries, including during wallet-signing latency), rebuild + retry ONCE.
  *  `fn` must itself re-fetch fresh holdings each call so the retry uses the current CIDs. */
 export async function withEphemeralRetry<T>(ephemeral: boolean, fn: () => Promise<T>): Promise<T> {

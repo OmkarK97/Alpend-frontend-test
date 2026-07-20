@@ -4,7 +4,8 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildBorrowTSWithPositionCommand } from '../commands/borrow';
 import { ASSETS, type AssetKey } from '../assets';
-import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids, withEphemeralRetry } from '../utils/transferContext';
+import { resolveOraclePrice } from '../utils/price';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { ADMIN_API_URL, POOL_OPERATOR } from '../config';
 
@@ -49,8 +50,11 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
         if (latest) {
           setReserveCid(latest.contractId);
           setPoolLiquidity(parseFloat(latest.createArgument?.totalLiquidity || '0'));
-          const feed = latest.createArgument?.riskParams?.priceFeedId;
-          setPrice(parseFloat(poolResp.oracle?.prices?.[feed]?.price || '0'));
+          // Resolve label -> alias -> raw feed id (fresh oracle keys prices by raw id, not the
+          // reserve's label) — same fix as useAdminData/usePosition. A plain prices[label] lookup
+          // returns undefined -> price 0 -> maxBorrow 0.
+          const feed = latest.createArgument?.riskParams?.priceFeedId || '';
+          setPrice(resolveOraclePrice(poolResp.oracle?.prices, poolResp.oracle?.feedAliases, feed));
         }
       } catch (err) {
         console.error('BorrowModal: preload failed:', err);
@@ -102,6 +106,10 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
     setError('');
 
     try {
+      // Ephemeral-retry (like Supply/Repay): a Canton Coin holding can re-issue between fetching
+      // the pool's holdings and the ledger's verdict, surfacing as INACTIVE_CONTRACTS (or
+      // CONTRACT_NOT_FOUND). On an ephemeral asset, re-fetch fresh holdings + resubmit once.
+      const doBorrow = async () => {
       // Borrow is a pool-as-sender payout (like withdraw): pull the pool operator's
       // current holdings of this asset — transfer inputs + disclosures, and, for
       // ephemeral assets (CC), freshReserveHoldingCids.
@@ -158,9 +166,11 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
         effectiveDisclosed
       );
 
-      const result = await submitTx('BorrowTSWithPosition', cmd, `Borrow ${amount} ${cfg.symbol}`, {
+      return await submitTx('BorrowTSWithPosition', cmd, `Borrow ${amount} ${cfg.symbol}`, {
         estimateTraffic: false,
       });
+      };
+      const result = await withEphemeralRetry(cfg.isEphemeral, doBorrow);
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;

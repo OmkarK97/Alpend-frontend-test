@@ -4,7 +4,7 @@ import type { TransactionPayload } from '../loop/provider';
 import type { PositionData } from '../types';
 import { buildWithdrawTSWithPositionCommand } from '../commands/withdraw';
 import { ASSETS, type AssetKey } from '../assets';
-import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids } from '../utils/transferContext';
+import { fetchPoolHoldings, poolCidFromDisclosed, fetchLiveCids, withEphemeralRetry } from '../utils/transferContext';
 import { fmtBalance } from '../utils/format';
 import { HealthFactorPreview } from './HealthFactorPreview';
 import type { SubmitTxOptions } from '../hooks/useLoop';
@@ -66,6 +66,10 @@ export function WithdrawModal({
     setError('');
 
     try {
+      // Ephemeral-retry: a Canton Coin holding can re-issue between fetching the pool's holdings
+      // and the ledger's verdict, surfacing as INACTIVE_CONTRACTS (or CONTRACT_NOT_FOUND). On an
+      // ephemeral asset, re-fetch fresh holdings + resubmit once. `doWithdraw` re-fetches each call.
+      const doWithdraw = async () => {
       // Re-resolve the current reserve / user-position / deposit CIDs — the cached
       // `position` copy can be stale (reserve CIDs churn on every accrue/action).
       const live = await fetchLiveCids(partyId);
@@ -126,12 +130,14 @@ export function WithdrawModal({
         effectiveDisclosed
       );
 
-      const result = await submitTx(
+      return await submitTx(
         'WithdrawTSWithPosition',
         cmd,
         fullWithdraw ? `Full ${cfg.symbol} withdrawal` : `Withdraw ${amount} ${cfg.symbol}`,
         { estimateTraffic: false }
       );
+      };
+      const result = await withEphemeralRetry(cfg.isEphemeral, doWithdraw);
 
       const r = result as Record<string, unknown>;
       const txUpdateId = r?._extractedUpdateId as string | undefined;
