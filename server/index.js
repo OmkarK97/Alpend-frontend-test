@@ -22,6 +22,27 @@ const AUDIENCE = process.env.AUDIENCE;
 const POOL_OPERATOR = process.env.POOL_OPERATOR_PARTY;
 const LENDING_PACKAGE_ID = process.env.LENDING_PACKAGE_ID;
 
+// TARGET_POOL_OPERATOR pins every pool/oracle/reserve selection to ONE deployment. Needed once the
+// query party (POOL_OPERATOR) can see more than one deployment's contracts — e.g. a decparty deployment
+// where POOL_OPERATOR is only the oraclePusher/observer and also still sees the old single-key pool.
+// Unset = original single-deployment behaviour (return everything). Contracts of PriceOracle / LendingPool /
+// AssetReserve all carry a `poolOperator` field, so this filter works uniformly across them.
+const TARGET_POOL_OPERATOR = process.env.TARGET_POOL_OPERATOR;
+const targetFilter = (contracts) =>
+  !TARGET_POOL_OPERATOR
+    ? contracts
+    : (contracts || []).filter((c) => c?.createArgument?.poolOperator === TARGET_POOL_OPERATOR);
+
+// Party to READ ledger state as. In a decparty deployment the query party (POOL_OPERATOR = oraclePusher)
+// is NOT a stakeholder of the new pool's AssetReserves (signatory poolOperator, no observer) or its
+// UserPositions (observer = the new poolOperator), so reading as it returns "no reserves" and the OLD
+// pool's positions. Read as the new poolOperator instead — it sees every contract in ITS deployment and
+// none of the other — which fixes reserve discovery AND scopes positions to this deployment. The server's
+// ledger user must have readAs/actAs this party (we granted CanActAs). Unset TARGET → read as POOL_OPERATOR
+// (original single-deployment behaviour). NOTE: oracle-push submissions still use POOL_OPERATOR (the
+// oraclePusher) as actAs — only READS switch to READ_PARTY.
+const READ_PARTY = TARGET_POOL_OPERATOR || POOL_OPERATOR;
+
 // Auth0 token cache
 let cachedToken = null;
 let tokenExpiry = null;
@@ -102,7 +123,11 @@ const CANTON_PROXY_URL = process.env.CANTON_PROXY_URL || 'http://34.72.196.18:40
  *  and all disclosed contracts (including ExternalPartyConfigState).
  *  @param {string} [sender] - sender party (defaults to pool operator) */
 async function fetchCCTransferFactory(sender, overrides = {}) {
-  const poolOperator = process.env.POOL_OPERATOR_PARTY;
+  // Receiver/sender default to the DEPLOYMENT's poolOperator (READ_PARTY = TARGET_POOL_OPERATOR when set).
+  // A supply transfers TO the pool operator, so on the decparty deployment this must be the new party —
+  // else the transfer factory is scoped ForOwner the old operator and SupplyTSWithPosition rejects it with
+  // a "Contract group identifier mismatch". Payout callers pass overrides.receiver (the user) explicitly.
+  const poolOperator = READ_PARTY;
   const effectiveSender = sender || poolOperator;
   const dso = `DSO::${(process.env.SYNCHRONIZER_ID || '').split('::')[1] || '1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337'}`;
 
@@ -324,20 +349,27 @@ function extractContractId(result) {
 app.get('/admin/pool-status', async (req, res) => {
   try {
     const [oracleContracts, poolContracts, reserveContracts, userPosContracts] = await Promise.all([
-      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR),
-      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR),
-      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR),
-      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, READ_PARTY),
+      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, READ_PARTY),
+      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, READ_PARTY),
+      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, READ_PARTY),
     ]);
 
-    const latestPool = poolContracts[poolContracts.length - 1];
+    // TARGET_POOL_OPERATOR pins to a specific deployment when this party sees more than one
+    // (see exerciseOracleChoiceAndRepoint). Unset = original single-deployment behaviour.
+    const TARGET = process.env.TARGET_POOL_OPERATOR;
+    const ownedByTarget = (c) => !TARGET || c?.createArgument?.poolOperator === TARGET;
+    const targetPools = poolContracts.filter(ownedByTarget);
+    const targetOracles = oracleContracts.filter(ownedByTarget);
+
+    const latestPool = targetPools[targetPools.length - 1];
     // Show the oracle the POOL actually points at — not "last active oracle". After a
     // rebuild-oracle the orphaned old oracle still lingers, and picking it would surface its
     // stale prices/aliases here. feedAliases is included so the frontend can resolve a reserve's
     // feed LABEL (e.g. "cc-feed") to the raw feed id the live price is stored under.
     const poolOracleCid = latestPool?.createArgument?.oracleCid;
-    const latestOracle = oracleContracts.find((o) => o.contractId === poolOracleCid)
-      || oracleContracts[oracleContracts.length - 1];
+    const latestOracle = targetOracles.find((o) => o.contractId === poolOracleCid)
+      || targetOracles[targetOracles.length - 1];
 
     const status = {
       oracle: latestOracle ? {
@@ -356,7 +388,7 @@ app.get('/admin/pool-status', async (req, res) => {
           pauseLiquidations: latestPool.createArgument?.pauseLiquidations ?? false,
         },
       } : null,
-      assetReserves: reserveContracts.map(r => ({
+      assetReserves: reserveContracts.filter(ownedByTarget).map(r => ({
         cid: r.contractId,
         instrumentId: r.createArgument?.instrumentId,
       })),
@@ -717,7 +749,14 @@ app.post('/admin/add-observer', async (req, res) => {
 app.get('/admin/cc-transfer-context', async (req, res) => {
   try {
     const party = req.query.party;
-    const data = await fetchCCTransferFactory(party);
+    // Optional overrides (used by the fund-safety drain test): explicit receiver + input holding cids,
+    // so we can build a raw poolOperator->attacker transfer of real pool CC and prove 1-of-2 is rejected.
+    const receiver = req.query.receiver;
+    const holdingCids = req.query.holdingCids ? String(req.query.holdingCids).split(',').filter(Boolean) : undefined;
+    const overrides = {};
+    if (receiver) overrides.receiver = receiver;
+    if (holdingCids) overrides.inputHoldingCids = holdingCids;
+    const data = await fetchCCTransferFactory(party, overrides);
 
     // Map response to frontend format
     const transferFactoryCid = data.factoryId;
@@ -818,7 +857,7 @@ app.get('/admin/cc-holdings/:party', async (req, res) => {
 app.get('/admin/asset-reserves', async (req, res) => {
   try {
     const templateId = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
-    const contracts = await queryContracts(templateId, POOL_OPERATOR);
+    const contracts = targetFilter(await queryContracts(templateId, READ_PARTY));
     res.json({ success: true, contracts });
   } catch (e) {
     console.error('QUERY ASSET RESERVES error:', e.message);
@@ -1184,8 +1223,8 @@ app.post('/admin/write-off-bad-debt', async (req, res) => {
 
     const [reserves, borrows, userPositions] = await Promise.all([
       queryContracts(RESERVE_TID, POOL_OPERATOR),
-      queryContracts(`${P}Borrow:BorrowPosition`, POOL_OPERATOR),
-      queryContracts(`${P}UserPosition:UserPosition`, POOL_OPERATOR),
+      queryContracts(`${P}Borrow:BorrowPosition`, READ_PARTY),
+      queryContracts(`${P}UserPosition:UserPosition`, READ_PARTY),
     ]);
 
     const debtReserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
@@ -1252,16 +1291,28 @@ app.post('/admin/write-off-bad-debt', async (req, res) => {
 async function exerciseOracleChoiceAndRepoint(choice, choiceArgument, actAs = [POOL_OPERATOR]) {
   const ORACLE_TID = `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`;
   const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+  // TARGET_POOL_OPERATOR pins pool/oracle selection to a SPECIFIC deployment. Needed once this
+  // pusher party (POOL_OPERATOR) can see more than one deployment's contracts — e.g. a decparty
+  // deployment where POOL_OPERATOR is only the oraclePusher/observer. There "last active" is
+  // ambiguous (it may pick the OTHER deployment's pool/oracle). Set it to the poolOperator party
+  // of the deployment this process should drive; unset keeps the original single-deployment
+  // behaviour (live prod untouched). NB: choices exercised here must be controlled by POOL_OPERATOR
+  // — for a decparty deployment that means oraclePusher-only choices (UpdatePrice / UpdateOracleCid);
+  // SetVerifier / RegisterFeed are poolOperator (the decparty) and must go through a signing ceremony.
+  const TARGET = process.env.TARGET_POOL_OPERATOR;
+  const ownedByTarget = (c) => !TARGET || c?.createArgument?.poolOperator === TARGET;
+
   // Target the oracle the POOL currently points at — NOT "last active oracle". After a
-  // rebuild-oracle there can be >1 active PriceOracle (the orphaned old one lingers), and
-  // picking the wrong one here would push prices to a stale oracle and repoint the pool back
-  // to it (re-introducing the manual-price shadow). The pool's oracleCid is authoritative.
-  const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+  // rebuild-oracle / SetVerifier there can be >1 active PriceOracle (the orphaned old one lingers),
+  // and picking the wrong one here would push prices to a stale oracle and repoint the pool back
+  // to it (re-introducing the manual-price shadow). The pool's oracleCid is authoritative; the
+  // fallback (last matching oracle) self-heals a stale pointer left by a poolOperator-side ceremony.
+  const pools = (await queryContracts(POOL_TID, POOL_OPERATOR)).filter(ownedByTarget);
   const pool = pools[pools.length - 1];
   const targetOracleCid = pool?.createArgument?.oracleCid;
-  const oracles = await queryContracts(ORACLE_TID, POOL_OPERATOR);
+  const oracles = (await queryContracts(ORACLE_TID, POOL_OPERATOR)).filter(ownedByTarget);
   const oracle = oracles.find((o) => o.contractId === targetOracleCid) || oracles[oracles.length - 1];
-  if (!oracle?.contractId) throw new Error('No active PriceOracle found');
+  if (!oracle?.contractId) throw new Error(`No active PriceOracle found${TARGET ? ` for poolOperator ${TARGET}` : ''}`);
 
   const result = await submitCommand([
     { ExerciseCommand: { templateId: ORACLE_TID, contractId: oracle.contractId, choice, choiceArgument } },
@@ -1270,7 +1321,7 @@ async function exerciseOracleChoiceAndRepoint(choice, choiceArgument, actAs = [P
 
   let newPoolCid = null;
   if (newOracleCid) {
-    const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
+    const pools = (await queryContracts(POOL_TID, POOL_OPERATOR)).filter(ownedByTarget);
     const pool = pools[pools.length - 1];
     if (pool?.contractId) {
       const upd = await submitCommand([
@@ -1630,10 +1681,12 @@ app.get('/admin/solvency', async (req, res) => {
   try {
     const P = `#alpend-lending-final-loop:Lending.`;
     const [reserveC, depositC, borrowC, holdingC] = await Promise.all([
-      queryContracts(`${P}AssetReserve:AssetReserve`, POOL_OPERATOR),
-      queryContracts(`${P}Deposit:DepositPosition`, POOL_OPERATOR),
-      queryContracts(`${P}Borrow:BorrowPosition`, POOL_OPERATOR),
-      queryContractsByInterface(HOLDING_INTERFACE, POOL_OPERATOR).catch(() => []),
+      queryContracts(`${P}AssetReserve:AssetReserve`, READ_PARTY),
+      queryContracts(`${P}Deposit:DepositPosition`, READ_PARTY),
+      queryContracts(`${P}Borrow:BorrowPosition`, READ_PARTY),
+      // Pool's real token holdings are owned by the DEPLOYMENT's poolOperator (READ_PARTY), not the
+      // legacy single-key party — else I1 (real tokens cover suppliers) checks the wrong party's balance.
+      queryContractsByInterface(HOLDING_INTERFACE, READ_PARTY).catch(() => []),
     ]);
 
     const num = (x) => parseFloat(x || '0') || 0;
@@ -1792,17 +1845,18 @@ app.get('/admin/liquidatable', async (req, res) => {
   try {
     const P = `#alpend-lending-final-loop:Lending.`;
     const [poolC, reserveC, userPosC, depositC, borrowC, oracleC] = await Promise.all([
-      queryContracts(`${P}Pool:LendingPool`, POOL_OPERATOR),
-      queryContracts(`${P}AssetReserve:AssetReserve`, POOL_OPERATOR),
-      queryContracts(`${P}UserPosition:UserPosition`, POOL_OPERATOR),
-      queryContracts(`${P}Deposit:DepositPosition`, POOL_OPERATOR),
-      queryContracts(`${P}Borrow:BorrowPosition`, POOL_OPERATOR),
-      queryContracts(`${P}Oracle:PriceOracle`, POOL_OPERATOR),
+      queryContracts(`${P}Pool:LendingPool`, READ_PARTY),
+      queryContracts(`${P}AssetReserve:AssetReserve`, READ_PARTY),
+      queryContracts(`${P}UserPosition:UserPosition`, READ_PARTY),
+      queryContracts(`${P}Deposit:DepositPosition`, READ_PARTY),
+      queryContracts(`${P}Borrow:BorrowPosition`, READ_PARTY),
+      queryContracts(`${P}Oracle:PriceOracle`, READ_PARTY),
     ]);
 
     const pool = poolC[poolC.length - 1];
     const oracle = oracleC[oracleC.length - 1];
-    const prices = oracle?.createArgument?.prices || {}; // TextMap feedId -> PriceData
+    const prices = oracle?.createArgument?.prices || {}; // TextMap RAW feedId -> PriceData
+    const feedAliases = oracle?.createArgument?.feedAliases || {}; // label (priceFeedId) -> raw feedId
 
     // Per-instrument reserve info (current CID + blob + risk params + indices + price).
     const byInstrument = {};
@@ -1816,7 +1870,7 @@ app.get('/admin/liquidatable', async (req, res) => {
         blob: r.createdEventBlob,
         templateId: r.templateId,
         instrumentId: a.instrumentId,
-        price: parseFloat(prices[feed]?.price || '0'),
+        price: parseFloat(prices[feedAliases[feed] || feed]?.price || '0'),
         ltv: parseFloat(a.riskParams?.ltv || '0'),
         liqThreshold: parseFloat(a.riskParams?.liquidationThreshold || '0'),
         liquidationBonus: parseFloat(a.riskParams?.liquidationBonus || '0'),
@@ -1912,7 +1966,7 @@ app.get('/admin/liquidatable', async (req, res) => {
 app.get('/query/lending-pool', async (req, res) => {
   try {
     const templateId = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
-    const contracts = await queryContracts(templateId, POOL_OPERATOR);
+    const contracts = targetFilter(await queryContracts(templateId, READ_PARTY));
     res.json({ success: true, contracts });
   } catch (e) {
     console.error('QUERY LENDING POOL error:', e.message);
@@ -1924,8 +1978,8 @@ app.get('/query/lending-pool', async (req, res) => {
 app.get('/query/user-position/:party', async (req, res) => {
   try {
     const templateId = `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`;
-    // Query as pool operator (observer on UserPosition), then filter by party
-    const contracts = await queryContracts(templateId, POOL_OPERATOR);
+    // Query as the deployment's poolOperator (observer on UserPosition), then filter by party
+    const contracts = await queryContracts(templateId, READ_PARTY);
     // Return ONLY this party's UserPosition(s). NEVER fall back to all contracts when the
     // party has none — a brand-new user would otherwise receive a stranger's UserPosition,
     // which makes the client think they're initialized and then fails on-chain with
@@ -1942,7 +1996,7 @@ app.get('/query/user-position/:party', async (req, res) => {
 app.get('/query/deposit-position/:party?', async (req, res) => {
   try {
     const templateId = `#alpend-lending-final-loop:Lending.Deposit:DepositPosition`;
-    const contracts = await queryContracts(templateId, POOL_OPERATOR);
+    const contracts = await queryContracts(templateId, READ_PARTY);
     const party = req.params.party;
     const filtered = party ? contracts.filter(c => c.createArgument?.depositor === party) : contracts;
     res.json({ success: true, contracts: filtered });
@@ -1956,7 +2010,7 @@ app.get('/query/deposit-position/:party?', async (req, res) => {
 app.get('/query/borrow-position/:party?', async (req, res) => {
   try {
     const templateId = `#alpend-lending-final-loop:Lending.Borrow:BorrowPosition`;
-    const contracts = await queryContracts(templateId, POOL_OPERATOR);
+    const contracts = await queryContracts(templateId, READ_PARTY);
     const party = req.params.party;
     const filtered = party ? contracts.filter(c => c.createArgument?.borrower === party) : contracts;
     res.json({ success: true, contracts: filtered });
@@ -1978,10 +2032,10 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
 
     // Fetch all pool-level contracts in parallel
     const [poolContracts, assetReserveContracts, userPosContracts, oracleContracts] = await Promise.all([
-      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR),
-      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR),
-      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR),
-      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR),
+      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, READ_PARTY),
+      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, READ_PARTY),
+      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, READ_PARTY),
+      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, READ_PARTY),
     ]);
 
     const disclosed = [];

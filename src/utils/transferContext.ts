@@ -1,8 +1,5 @@
-import { ADMIN_API_URL } from '../config';
+import { ADMIN_API_URL, POOL_OPERATOR } from '../config';
 import type { DisclosedContract } from '../types';
-
-const POOL_OPERATOR =
-  'google-oauth2_007c102908799751727857785::12206d5dbed87522889b28486cea3dd6b6c1fc4b3ca156d2c4f31318710fcba57be3';
 
 export interface TransferContext {
   transferFactoryCid: string;

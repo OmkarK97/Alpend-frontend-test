@@ -163,8 +163,10 @@ export function LiquidationsPage({ partyId, position, submitTx }: Props) {
         disc(scan.poolCid, scan.poolBlob, scan.poolTemplateId),
         disc(scan.oracleCid, scan.oracleBlob, scan.oracleTemplateId),
         disc(c.userPositionCid, c.userPositionBlob, c.userPositionTemplateId),
-        disc(debt.cid, debt.blob, debt.templateId),
-        disc(collateral.cid, collateral.blob, collateral.templateId),
+        // Disclose EVERY borrow and collateral leg, not just the repaid pair: LiquidateTS
+        // recomputes HF over the borrower's whole basket, so it references the OTHER positions
+        // too — an undisclosed leg fails with CONTRACT_NOT_FOUND (liquidator isn't a stakeholder).
+        ...[...c.borrows, ...c.collaterals].map((l) => disc(l.cid, l.blob, l.templateId)),
         ...[...c.borrows, ...c.collaterals].map((l) => disc(l.reserveCid, l.reserveBlob, l.reserveTemplateId)),
         ...debtCtx.disclosedContracts.map((d) => ({
           templateId: d.templateId || '',
