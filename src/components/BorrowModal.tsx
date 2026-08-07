@@ -150,6 +150,8 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
           borrowAssetReserveCid: live.reservesByInstrument[cfg.instrumentId] || reserveCid,
           transferFactoryCid: ctx.transferFactoryCid,
           userPositionCid: live.userPositionCid || position.userPositionCid,
+          // TN-13: the DAR gates new borrow on the caller's PoolAccess grant.
+          poolAccessCid: live.poolAccessCid,
           // Other reserves backing the user's collateral so the DAR's on-chain HF
           // counts the full basket.
           accountReserveCids,

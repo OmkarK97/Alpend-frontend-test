@@ -21,7 +21,10 @@ export function PoolSetup({ partyId, submitTx, addLog }: Props) {
   useEffect(() => {
     (async () => {
       try {
-        const resp = await fetch(`${ADMIN_API_URL}/admin/pool-status`);
+        // pass ?party so pool-status returns only THIS party's registry (never the full member list)
+        const resp = await fetch(
+          `${ADMIN_API_URL}/admin/pool-status${partyId ? `?party=${encodeURIComponent(partyId)}` : ''}`
+        );
         const data = await resp.json();
         if (!data.success) return;
 

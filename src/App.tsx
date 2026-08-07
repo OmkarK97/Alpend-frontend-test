@@ -8,6 +8,7 @@ import { AdminPage } from './components/AdminPage';
 import { TransferPage } from './components/TransferPage';
 import { LiquidationsPage } from './components/LiquidationsPage';
 import { TransactionLog } from './components/TransactionLog';
+import { AlpendV2 } from './v2/AlpendV2';
 
 export default function App() {
   const {
@@ -36,6 +37,25 @@ export default function App() {
   const isAdmin = route === '#/admin';
   const isTransfer = route === '#/transfer';
   const isLiquidations = route === '#/liquidations';
+
+  // Clean v2 surface — full-page takeover at #/v2, isolated from the classic app.
+  if (route === '#/v2') {
+    return (
+      <AlpendV2
+        position={position}
+        partyId={partyId}
+        isConnected={isConnected}
+        isConnecting={isConnecting}
+        connect={connect}
+        disconnect={disconnect}
+        submitTx={submitTx}
+        addLog={addLog}
+        onExit={() => {
+          window.location.hash = '#/';
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app">

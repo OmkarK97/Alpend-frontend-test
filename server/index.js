@@ -43,6 +43,13 @@ const targetFilter = (contracts) =>
 // oraclePusher) as actAs — only READS switch to READ_PARTY.
 const READ_PARTY = TARGET_POOL_OPERATOR || POOL_OPERATOR;
 
+// TN-14: routine-maintenance key on LendingPool. Controls GrantPoolAccess (onboarding),
+// ConsolidateReserveHoldings, and RefreshReserveHoldings — none of which can move value to an
+// outside party, so it stays a HOT single key even when poolOperator becomes an M-of-N threshold
+// party (otherwise onboarding one user or a routine consolidation would each need a signing
+// ceremony). Defaults to POOL_OPERATOR for single-key testing.
+const MAINTENANCE_OPERATOR = process.env.MAINTENANCE_OPERATOR_PARTY || POOL_OPERATOR;
+
 // Auth0 token cache
 let cachedToken = null;
 let tokenExpiry = null;
@@ -392,10 +399,14 @@ app.get('/admin/pool-status', async (req, res) => {
         cid: r.contractId,
         instrumentId: r.createArgument?.instrumentId,
       })),
-      userPositions: userPosContracts.map(u => ({
-        cid: u.contractId,
-        user: u.createArgument?.user,
-      })),
+      // PRIVACY: only ever expose the REQUESTING party's own registry (PV-01). Never the full
+      // member list — that leaks every user of the pool. Callers that need "does my party have a
+      // registry?" pass ?party=<self>; without it we return nothing.
+      userPositions: req.query.party
+        ? userPosContracts
+            .filter((u) => u.createArgument?.user === req.query.party)
+            .map((u) => ({ cid: u.contractId, user: u.createArgument?.user }))
+        : [],
     };
 
     console.log(`Pool status: oracle=${!!status.oracle}, pool=${!!status.pool}, reserves=${status.assetReserves.length}, positions=${status.userPositions.length}`);
@@ -477,6 +488,7 @@ app.post('/admin/create-pool', async (req, res) => {
             poolOperator: POOL_OPERATOR,
             oraclePusher: process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR,
             treasuryParty: process.env.TREASURY_PARTY || POOL_OPERATOR,
+            maintenanceOperator: MAINTENANCE_OPERATOR,
             oracleCid,
             assetReserveCids: [],
             pauseDeposits: false,
@@ -515,6 +527,16 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
 
+    // TN-20: AddAssetReserve now requires the CURRENT cids of every already-registered reserve.
+    // The DAR's L-6 duplicate-instrument guard reads each existing reserve's instrumentId, and the
+    // pool's STORED cids go stale after any AccrueInterest (each archives + re-creates the reserve).
+    // The caller must supply them fresh, covering EXACTLY the registered set. For the first reserve
+    // this is []. We resolve the live set from the ledger, scoped to THIS deployment.
+    const allReserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, READ_PARTY);
+    const currentReserveCids = allReserves
+      .filter((c) => !TARGET_POOL_OPERATOR || c?.createArgument?.poolOperator === TARGET_POOL_OPERATOR)
+      .map((c) => c.contractId);
+
     const commands = [
       {
         ExerciseCommand: {
@@ -542,6 +564,8 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
               // Annualized decay on idle balance (CC holding fee); 0 for non-decaying assets like USDCx
               holdingFeeRate: interestRateParams.holdingFeeRate ?? '0.0000000000',
             },
+            // TN-20: fresh cids of all already-registered reserves (must cover exactly the set).
+            currentReserveCids,
           },
         },
       },
@@ -726,7 +750,8 @@ app.post('/admin/add-observer', async (req, res) => {
       },
     ];
 
-    const result = await submitCommand(commands, [POOL_OPERATOR]);
+    // TN-14: GrantPoolAccess is controlled by maintenanceOperator, not poolOperator.
+    const result = await submitCommand(commands, [MAINTENANCE_OPERATOR]);
     // GrantPoolAccess returns the new PoolAccess cid. Do NOT surface it as a pool
     // CID — the pool is unchanged (nonconsuming), so the caller keeps its poolCid.
     const poolAccessCid = extractContractId(result);
@@ -854,6 +879,48 @@ app.get('/admin/cc-holdings/:party', async (req, res) => {
 });
 
 /** GET /admin/asset-reserves — query existing AssetReserve contracts */
+/** GET /admin/pool-access/:party — does this party hold a PoolAccess grant? (PV-01 membership check) */
+app.get('/admin/pool-access/:party', async (req, res) => {
+  try {
+    const contracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:PoolAccess`, READ_PARTY);
+    // PRIVACY: only ever the requesting party's own grant — never expose others'. The cid is needed
+    // as the poolAccessCid argument to SupplyTSWithPosition / BorrowTSWithPosition (TN-13).
+    const own = contracts.find((c) => c.createArgument?.user === req.params.party);
+    res.json({ success: true, hasAccess: !!own, cid: own?.contractId || null });
+  } catch (e) {
+    console.error('QUERY POOL ACCESS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/revoke-pool-access { party } — archive this party's PoolAccess grant (operator-only). */
+app.post('/admin/revoke-pool-access', async (req, res) => {
+  try {
+    const { party } = req.body;
+    if (!party) return res.status(400).json({ success: false, error: 'party is required' });
+    const contracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:PoolAccess`, READ_PARTY);
+    const grant = contracts.find((c) => c.createArgument?.user === party);
+    if (!grant) return res.json({ success: true, revoked: false, message: 'No PoolAccess grant for this party' });
+    await submitCommand(
+      [
+        {
+          ExerciseCommand: {
+            templateId: `#alpend-lending-final-loop:Lending.Pool:PoolAccess`,
+            contractId: grant.contractId,
+            choice: 'RevokePoolAccess',
+            choiceArgument: {},
+          },
+        },
+      ],
+      [POOL_OPERATOR]
+    );
+    res.json({ success: true, revoked: true });
+  } catch (e) {
+    console.error('REVOKE POOL ACCESS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.get('/admin/asset-reserves', async (req, res) => {
   try {
     const templateId = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
@@ -2063,10 +2130,12 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
       });
     }
 
-    // Add UserPosition for the specified party (latest)
+    // Add UserPosition for the specified party (latest). PRIVACY/CORRECTNESS: only ever the
+    // requesting party's OWN registry — NEVER fall back to another user's UserPosition (that both
+    // leaks a stranger's contract and hands them a foreign registry blob).
     if (party) {
       const userPos = userPosContracts.filter(c => c.createArgument?.user === party);
-      const latestUserPos = userPos[userPos.length - 1] || userPosContracts[userPosContracts.length - 1];
+      const latestUserPos = userPos[userPos.length - 1];
       if (latestUserPos?.contractId && latestUserPos?.createdEventBlob) {
         disclosed.push({
           templateId: latestUserPos.templateId || `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`,

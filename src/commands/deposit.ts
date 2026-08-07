@@ -11,6 +11,8 @@ export function buildSupplyTSWithPositionCommand(
     transferFactoryCid: string;
     assetReserveCid: string;
     userPositionCid: string;
+    // TN-13: the caller's PoolAccess grant — the DAR gates NEW supply on it (assertPoolAccess).
+    poolAccessCid: string;
     enableAsCollateral: boolean;
     existingDepositCid: string | null;
     choiceContext: { values: Record<string, unknown> };
@@ -33,6 +35,7 @@ export function buildSupplyTSWithPositionCommand(
             transferFactoryCid: params.transferFactoryCid,
             assetReserveCid: params.assetReserveCid,
             userPositionCid: params.userPositionCid,
+            poolAccessCid: params.poolAccessCid,
             enableAsCollateral: params.enableAsCollateral,
             existingDepositCid: params.existingDepositCid,
             choiceContext: params.choiceContext,

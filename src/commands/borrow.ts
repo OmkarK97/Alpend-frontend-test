@@ -10,6 +10,8 @@ export function buildBorrowTSWithPositionCommand(
     borrowAssetReserveCid: string;
     transferFactoryCid: string;
     userPositionCid: string;
+    // TN-13: the caller's PoolAccess grant — the DAR gates NEW borrow on it (assertPoolAccess).
+    poolAccessCid: string;
     // Current CIDs of all OTHER reserves backing the user's collateral, for the
     // DAR's on-chain health-factor recompute (C-1). Excludes the primary reserve.
     accountReserveCids: string[];
@@ -36,6 +38,7 @@ export function buildBorrowTSWithPositionCommand(
             borrowAssetReserveCid: params.borrowAssetReserveCid,
             transferFactoryCid: params.transferFactoryCid,
             userPositionCid: params.userPositionCid,
+            poolAccessCid: params.poolAccessCid,
             accountReserveCids: params.accountReserveCids,
             existingBorrowCid: params.existingBorrowCid,
             freshReserveHoldingCids: params.freshReserveHoldingCids,

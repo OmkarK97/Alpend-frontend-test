@@ -42,15 +42,17 @@ export interface LiveCids {
   reservesByInstrument: Record<string, string>; // instrumentId.id -> current reserve cid
   depositsByInstrument: Record<string, string>;  // instrumentId.id -> current deposit cid
   borrowsByInstrument: Record<string, string>;   // instrumentId.id -> current borrow cid
+  poolAccessCid: string;                         // this party's PoolAccess grant (TN-13 permissioning)
 }
 
 export async function fetchLiveCids(partyId: string): Promise<LiveCids> {
-  const [poolResp, arResp, upResp, depResp, borResp] = await Promise.all([
+  const [poolResp, arResp, upResp, depResp, borResp, paResp] = await Promise.all([
     fetch(`${ADMIN_API_URL}/query/lending-pool`).then((r) => r.json()).catch(() => ({ contracts: [] })),
     fetch(`${ADMIN_API_URL}/admin/asset-reserves`).then((r) => r.json()).catch(() => ({ contracts: [] })),
     fetch(`${ADMIN_API_URL}/query/user-position/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ contracts: [] })),
     fetch(`${ADMIN_API_URL}/query/deposit-position/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ contracts: [] })),
     fetch(`${ADMIN_API_URL}/query/borrow-position/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ contracts: [] })),
+    fetch(`${ADMIN_API_URL}/admin/pool-access/${encodeURIComponent(partyId)}`).then((r) => r.json()).catch(() => ({ cid: '' })),
   ]);
 
   type C = { contractId: string; createArgument?: { user?: string; instrumentId?: { id?: string } } };
@@ -77,7 +79,9 @@ export async function fetchLiveCids(partyId: string): Promise<LiveCids> {
     if (id && !borrowsByInstrument[id]) borrowsByInstrument[id] = c.contractId;
   }
 
-  return { poolCid, userPositionCid, reservesByInstrument, depositsByInstrument, borrowsByInstrument };
+  const poolAccessCid: string = paResp.cid || '';
+
+  return { poolCid, userPositionCid, reservesByInstrument, depositsByInstrument, borrowsByInstrument, poolAccessCid };
 }
 
 /**

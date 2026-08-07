@@ -95,6 +95,8 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
           transferFactoryCid: ctx.transferFactoryCid,
           assetReserveCid: live.reservesByInstrument[cfg.instrumentId] || reserveCid,
           userPositionCid: live.userPositionCid || position.userPositionCid,
+          // TN-13: the DAR gates new supply on the caller's PoolAccess grant.
+          poolAccessCid: live.poolAccessCid,
           enableAsCollateral,
           // Position unification: if a deposit for this asset already exists, merge into it
           // (DAR realizes its accrued value + adds this supply → one position, not a duplicate).
