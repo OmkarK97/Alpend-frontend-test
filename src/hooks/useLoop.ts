@@ -10,6 +10,7 @@ import {
   type TransactionPayload,
 } from '../loop/provider';
 import type { TransactionLog } from '../types';
+import { normalizeDisclosedList } from '../utils/disclosure';
 
 export type SubmitTxOptions = {
   estimateTraffic?: boolean;
@@ -145,6 +146,16 @@ export function useLoop() {
   const submitTx = useCallback(
     async (operation: string, payload: TransactionPayload, message: string, options?: SubmitTxOptions) => {
       if (!provider) throw new Error('Not connected');
+
+      // SINGLE POINT OF TRUTH for disclosure hygiene. Every command — supply, borrow,
+      // withdraw, repay, collateral toggles, liquidations, migration — passes through here,
+      // so normalizing once means no individual call site can send a malformed or
+      // version-pinned templateId. See utils/disclosure.ts for why both cases break.
+      payload = {
+        ...payload,
+        disclosedContracts: normalizeDisclosedList(payload.disclosedContracts),
+      };
+
       addLog(operation, 'pending', `Submitting: ${message}`);
 
       // The Loop SDK's submitAndWaitForTransaction may never resolve —

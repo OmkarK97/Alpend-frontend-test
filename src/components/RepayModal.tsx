@@ -64,10 +64,10 @@ export function RepayModal({ asset, partyId, position, submitTx, onClose }: Prop
       );
 
       const effectiveDisclosed = ctx.disclosedContracts.map((dc) => ({
-        templateId: dc.templateId || '',
+        ...(dc.templateId ? { templateId: dc.templateId } : {}),
         contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob,
-        domainId: dc.domainId || dc.synchronizerId || '',
+        ...(dc.domainId || dc.synchronizerId ? { domainId: dc.domainId || dc.synchronizerId } : {}),
       }));
 
       // Re-resolve current CIDs (reserve/borrow/user-position churn between refreshes).

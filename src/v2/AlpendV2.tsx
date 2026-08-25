@@ -5,7 +5,6 @@ import { ASSETS, type AssetKey } from '../assets';
 import { ADMIN_API_URL } from '../config';
 import { fetchPoolDisclosedContracts } from '../utils/transferContext';
 import { buildInitializeUserPositionCommand } from '../commands/pool';
-import { buildArchiveUserPositionCommand } from '../commands/migration';
 import { SupplyModal } from '../components/SupplyModal';
 import { BorrowModal } from '../components/BorrowModal';
 import { RepayModal } from '../components/RepayModal';
@@ -57,7 +56,6 @@ export function AlpendV2({
   const [initLoading, setInitLoading] = useState(false);
   const [accessState, setAccessState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const [hasAccess, setHasAccess] = useState<boolean | null>(null);
-  const [archiving, setArchiving] = useState(false);
 
   // loose accessor for the display fields (usePosition returns more than PositionData narrows)
   const p = position as unknown as Record<string, unknown>;
@@ -79,38 +77,6 @@ export function AlpendV2({
     if (isConnected && position.hasUserPosition && hasAccess === null) checkAccess();
   }, [isConnected, position.hasUserPosition, hasAccess, checkAccess]);
 
-  const handleArchive = async () => {
-    if (!userPositionCid) return;
-    if (
-      !window.confirm(
-        'Reset from scratch: archive your position registry AND revoke pool access, returning to onboarding?\n\nArchiving only works if you have no open supplies or borrows.'
-      )
-    )
-      return;
-    setArchiving(true);
-    try {
-      // 1. archive the registry (user signs — controller is the user)
-      const cmd = buildArchiveUserPositionCommand(userPositionCid);
-      await submitTx('ArchiveUserPosition', cmd, 'Reset position registry (test)', { estimateTraffic: false });
-      // 2. revoke pool access (operator-only submit, non-fatal if it fails)
-      try {
-        await fetch(`${ADMIN_API_URL}/admin/revoke-pool-access`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ party: partyId }),
-        });
-      } catch (e) {
-        addLog('RevokePoolAccess', 'error', `Revoke failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      setHasAccess(false);
-      setAccessState('idle');
-      await position.refresh();
-    } catch (err) {
-      addLog('ArchiveUserPosition', 'error', `Failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setArchiving(false);
-    }
-  };
 
   const toggleTheme = () => {
     const root = document.documentElement;
@@ -123,8 +89,14 @@ export function AlpendV2({
   const handleInit = async () => {
     setInitLoading(true);
     try {
+      // One-shot PoolAccess token from GrantPoolAccess (TN-13/RA-07); fetched live so a
+      // grant from an earlier session still works.
+      const acc = await (
+        await fetch(`${ADMIN_API_URL}/user/pool-access/${encodeURIComponent(partyId)}`)
+      ).json();
+      if (!acc.poolAccessCid) throw new Error(acc.hint || 'No PoolAccess token — grant access first.');
       const disclosed = await fetchPoolDisclosedContracts(partyId);
-      const cmd = buildInitializeUserPositionCommand(position.poolCid, partyId, disclosed);
+      const cmd = buildInitializeUserPositionCommand(position.poolCid, partyId, acc.poolAccessCid, disclosed);
       await submitTx('InitializeUserPosition', cmd, 'Initialize user position', {
         estimateTraffic: false,
       });
@@ -277,9 +249,6 @@ export function AlpendV2({
                       <p className="av-done" style={{ margin: 0 }}>
                         Done · registry created on-ledger
                       </p>
-                      <button className="av-mini" onClick={handleArchive} disabled={archiving}>
-                        {archiving ? 'Resetting…' : 'Archive & start over'}
-                      </button>
                     </div>
                   ) : (
                     <>
@@ -571,9 +540,6 @@ export function AlpendV2({
             <span style={{ color: hasAccess ? 'var(--good)' : 'var(--ink-3)', fontFamily: 'var(--mono)', fontSize: '.72rem' }}>
               {hasAccess ? '✓ pool access granted' : '— no pool access'}
             </span>
-            <button className="av-mini" onClick={handleArchive} disabled={archiving || !userPositionCid}>
-              {archiving ? 'Resetting…' : 'Reset from scratch (test)'}
-            </button>
           </div>
           <div style={{ marginTop: 10 }}>
             v2 · figures are your live testnet position · reusing the audited action modals for now

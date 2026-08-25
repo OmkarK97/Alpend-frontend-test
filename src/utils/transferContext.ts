@@ -257,10 +257,10 @@ export async function fetchPoolHoldings(path: string): Promise<PoolHoldings> {
     disclosed: holdings
       .filter((h) => h.contractId && h.createdEventBlob)
       .map((h) => ({
-        templateId: h.templateId || '',
+        ...(h.templateId ? { templateId: h.templateId } : {}),
         contractId: h.contractId as string,
         createdEventBlob: h.createdEventBlob as string,
-        domainId: h.domainId || h.synchronizerId || '',
+        ...(h.domainId || h.synchronizerId ? { domainId: h.domainId || h.synchronizerId } : {}),
       })),
   };
 }

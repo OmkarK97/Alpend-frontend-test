@@ -65,7 +65,7 @@ function assetKeyOf(id: string): AssetKey | null {
 }
 
 const disc = (contractId: string, blob: string, templateId: string): DisclosedContract => ({
-  templateId: templateId || '',
+  ...(templateId ? { templateId: templateId } : {}),
   contractId,
   createdEventBlob: blob,
   domainId: SYNCHRONIZER_ID,
@@ -169,13 +169,13 @@ export function LiquidationsPage({ partyId, position, submitTx }: Props) {
         ...[...c.borrows, ...c.collaterals].map((l) => disc(l.cid, l.blob, l.templateId)),
         ...[...c.borrows, ...c.collaterals].map((l) => disc(l.reserveCid, l.reserveBlob, l.reserveTemplateId)),
         ...debtCtx.disclosedContracts.map((d) => ({
-          templateId: d.templateId || '',
+          ...(d.templateId ? { templateId: d.templateId } : {}),
           contractId: d.contractId,
           createdEventBlob: d.createdEventBlob,
           domainId: d.domainId || d.synchronizerId || SYNCHRONIZER_ID,
         })),
         ...collCtx.disclosedContracts.map((d) => ({
-          templateId: d.templateId || '',
+          ...(d.templateId ? { templateId: d.templateId } : {}),
           contractId: d.contractId,
           createdEventBlob: d.createdEventBlob,
           domainId: d.domainId || d.synchronizerId || SYNCHRONIZER_ID,

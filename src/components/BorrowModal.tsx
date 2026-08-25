@@ -122,10 +122,10 @@ export function BorrowModal({ asset, partyId, position, submitTx, onClose }: Pro
 
       const allDisclosed = [
         ...ctx.disclosedContracts.map((dc) => ({
-          templateId: dc.templateId || '',
+          ...(dc.templateId ? { templateId: dc.templateId } : {}),
           contractId: dc.contractId,
           createdEventBlob: dc.createdEventBlob,
-          domainId: dc.domainId || dc.synchronizerId || '',
+          ...(dc.domainId || dc.synchronizerId ? { domainId: dc.domainId || dc.synchronizerId } : {}),
         })),
         ...poolHoldings.disclosed,
       ];

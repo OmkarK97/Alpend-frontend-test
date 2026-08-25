@@ -1,12 +1,12 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import type { LoopProvider, TransactionPayload } from '../loop/provider';
 import type { PositionData, TransactionLog as TxLog, DepositPosition } from '../types';
 import type { SubmitTxOptions } from '../hooks/useLoop';
 import { buildInitializeUserPositionCommand } from '../commands/pool';
 import { buildEnableCollateralCommand, buildDisableCollateralCommand } from '../commands/collateral';
-import { buildArchiveUserPositionCommand } from '../commands/migration';
 import { fetchPoolDisclosedContracts, fetchLiveCids, poolCidFromDisclosed } from '../utils/transferContext';
 import { fmtBalance, fmtUsd } from '../utils/format';
+import { ADMIN_API_URL } from '../config';
 import { DashboardSkeleton } from './DashboardSkeleton';
 import { MigrationBanner } from './MigrationBanner';
 import { SupplyModal } from './SupplyModal';
@@ -60,30 +60,18 @@ export function Dashboard({
 }: Props) {
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [initLoading, setInitLoading] = useState(false);
+  const [grantLoading, setGrantLoading] = useState(false);
+  // NEW-03 diagnostic: an UNUSED PoolAccess token while this wallet ALREADY holds a registry.
+  // The DAR cannot detect this (no keys, no ACS query in a choice — see the PoolAccess template),
+  // so surfacing it in the UI is the only place a user would ever see it.
+  const [spareAccessCid, setSpareAccessCid] = useState<string | null>(null);
+  const [dupBusy, setDupBusy] = useState(false);
+  // Optimistic: GrantPoolAccess is nonconsuming and mints a token the user cannot see until
+  // they hold it, so we track "granted this session" rather than re-querying the ledger.
+  const [hasAccess, setHasAccess] = useState(false);
   const [togglingCid, setTogglingCid] = useState<string | null>(null);
-  const [resetting, setResetting] = useState(false);
 
-  // TEST-ONLY: archive an EMPTY UserPosition so this wallet can be migrated fresh.
-  // Guarded on "no live positions" — archiving a populated registry would orphan its
-  // Deposit/Borrow positions (they'd survive but be unreachable without the registry CID).
-  const canResetRegistry =
-    position.hasUserPosition &&
-    position.depositPositions.length === 0 &&
-    position.borrowPositions.length === 0;
 
-  const handleResetRegistry = async () => {
-    if (!position.userPositionCid) return;
-    setResetting(true);
-    try {
-      const cmd = buildArchiveUserPositionCommand(position.userPositionCid);
-      await submitTx('ArchiveUserPosition', cmd, 'Reset position registry (test)', { estimateTraffic: false });
-      await position.refresh();
-    } catch (err) {
-      addLog('ArchiveUserPosition', 'error', `Failed: ${err instanceof Error ? err.message : err}`);
-    } finally {
-      setResetting(false);
-    }
-  };
 
   // Enable/disable a supply position as collateral. No token transfer; DisableCollateral
   // re-checks HF >= 1 on-chain (so it needs the OTHER reserves for the basket).
@@ -125,16 +113,86 @@ export function Dashboard({
     }
   };
 
+  useEffect(() => {
+    if (!partyId || !position.hasUserPosition) { setSpareAccessCid(null); return; }
+    fetch(`${ADMIN_API_URL}/user/pool-access/${encodeURIComponent(partyId)}`)
+      .then((r) => r.json())
+      .then((d) => setSpareAccessCid(d.registryInitialized === false ? d.poolAccessCid : null))
+      .catch(() => setSpareAccessCid(null));
+  }, [partyId, position.hasUserPosition]);
+
+  /** TEST ONLY: spend the spare token on InitializeUserPosition to prove whether a second
+   *  registry can be created. Destructive — a wallet with two registries cannot be repaired,
+   *  because UserPosition has no archive choice (TN-03). */
+  const handleDuplicateInit = async () => {
+    if (!spareAccessCid) return;
+    if (!window.confirm(
+      'TEST: spend the spare PoolAccess token on InitializeUserPosition?\n\n' +
+      'If this succeeds you will hold TWO registries. That state is PERMANENT — UserPosition has ' +
+      'no archive choice — so this wallet becomes unusable for further testing.'
+    )) return;
+    setDupBusy(true);
+    try {
+      const disclosed = await fetchPoolDisclosedContracts(partyId);
+      const cmd = buildInitializeUserPositionCommand(position.poolCid, partyId, spareAccessCid, disclosed);
+      await submitTx('InitializeUserPosition', cmd, 'NEW-03 test: second registry', { estimateTraffic: false });
+      addLog('InitializeUserPosition', 'success', 'Second registry CREATED — NEW-03 hazard is real; only the backend guard prevents it.');
+      await position.refresh();
+    } catch (err) {
+      addLog('InitializeUserPosition', 'error', `Rejected: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      setDupBusy(false);
+    }
+  };
+
   const netWorth =
     parseFloat(position.totalSupplied) - parseFloat(position.totalBorrowed);
+
+  /** Ask the backend to onboard this wallet: maintenanceOperator exercises GrantPoolAccess,
+   *  which mints the per-user PoolAccess token that InitializeUserPosition then consumes.
+   *  Runs server-side because the choice is controlled by maintenanceOperator, not the user —
+   *  it's a hot key, so no multisig ceremony is involved and no funds can move. */
+  const handleGrantAccess = async () => {
+    setGrantLoading(true);
+    try {
+      const resp = await fetch(`${ADMIN_API_URL}/user/grant-access`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user: partyId }),
+      });
+      const data = await resp.json();
+      if (!data.success) throw new Error(data.error || 'grant failed');
+      addLog(
+        'GrantPoolAccess',
+        'success',
+        `Access granted by ${String(data.grantedBy).slice(0, 28)}… — ${data.next}`
+      );
+      setHasAccess(true);
+      await position.refresh();
+    } catch (err) {
+      addLog('GrantPoolAccess', 'error', `Failed: ${err instanceof Error ? err.message : err}`);
+    } finally {
+      setGrantLoading(false);
+    }
+  };
 
   const handleInitPosition = async () => {
     setInitLoading(true);
     try {
+      // The one-shot PoolAccess token minted by Grant Access. Fetch it live rather than
+      // relying on session state — the grant may have happened in an earlier session.
+      const accResp = await fetch(
+        `${ADMIN_API_URL}/user/pool-access/${encodeURIComponent(partyId)}`
+      );
+      const acc = await accResp.json();
+      if (!acc.poolAccessCid) {
+        throw new Error(acc.hint || 'No PoolAccess token — run Grant Access first.');
+      }
       const disclosed = await fetchPoolDisclosedContracts(partyId);
       const cmd = buildInitializeUserPositionCommand(
         position.poolCid,
         partyId,
+        acc.poolAccessCid,
         disclosed
       );
       await submitTx(
@@ -218,18 +276,19 @@ export function Dashboard({
         addLog={addLog}
       />
 
-      {/* TEST-ONLY: reset an empty registry so this wallet can be migrated fresh. Not for production. */}
-      {canResetRegistry && (
-        <div className="init-banner">
+
+      {spareAccessCid && (
+        <div className="init-banner" style={{ borderColor: '#b45309' }}>
           <div className="init-banner-content">
-            <h3>Reset position registry (test only)</h3>
+            <h3>⚠ Unused pool-access token (NEW-03)</h3>
             <p>
-              Your registry is empty, so archiving it is safe — it lets this wallet be migrated fresh.
-              Test-only; this is not part of the real user flow.
+              This wallet already has a position registry, yet an unused PoolAccess token is still
+              outstanding. Spending it would create a SECOND registry — the DAR cannot prevent this
+              (no contract keys, and a choice cannot query the ACS), so the operator must revoke it.
             </p>
           </div>
-          <button className="btn-connect-large" onClick={handleResetRegistry} disabled={resetting}>
-            {resetting ? 'Resetting…' : 'Reset Registry'}
+          <button onClick={handleDuplicateInit} disabled={dupBusy} className="btn-action btn-init">
+            {dupBusy ? 'Testing…' : 'Test: spend spare token'}
           </button>
         </div>
       )}
@@ -243,13 +302,24 @@ export function Dashboard({
               Initialize your lending position to start supplying and borrowing.
             </p>
           </div>
-          <button
-            onClick={handleInitPosition}
-            disabled={initLoading}
-            className="btn-action btn-init"
-          >
-            {initLoading ? 'Initializing...' : 'Initialize Position'}
-          </button>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button
+              onClick={handleGrantAccess}
+              disabled={grantLoading || hasAccess}
+              className="btn-action btn-init"
+              title="maintenanceOperator mints your PoolAccess token (step 1 of 2)"
+            >
+              {grantLoading ? 'Granting...' : hasAccess ? '✓ Access Granted' : '1 · Grant Access'}
+            </button>
+            <button
+              onClick={handleInitPosition}
+              disabled={initLoading}
+              className="btn-action btn-init"
+              title="Consumes the PoolAccess token and creates your UserPosition (step 2 of 2)"
+            >
+              {initLoading ? 'Initializing...' : '2 · Initialize Position'}
+            </button>
+          </div>
         </div>
       )}
 

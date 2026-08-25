@@ -50,8 +50,17 @@ export function MigrationBanner({ partyId, submitTx, onDone, addLog }: Props) {
       const live = await fetchLiveCids(partyId);
       const reserveCids = [...new Set(instrs.map((id) => live.reservesByInstrument[id]).filter(Boolean))];
       if (reserveCids.length === 0) throw new Error('Could not resolve reserve CIDs for the snapshot instruments.');
+      // One-shot PoolAccess token minted by GrantPoolAccess — fetched live, since the grant
+      // may have happened long before this wallet opened the app.
+      const acc = await fetch(
+        `${ADMIN_API_URL}/user/pool-access/${encodeURIComponent(partyId)}`
+      ).then((x) => x.json());
+      if (!acc.poolAccessCid) throw new Error(acc.hint || 'No PoolAccess token — ask the operator to grant access first.');
       const disclosed = await fetchPoolDisclosedContracts(partyId);
-      const cmd = buildMigrationAcceptCommand({ snapshotCid: snapshot.contractId, reserveCids }, disclosed);
+      const cmd = buildMigrationAcceptCommand(
+        { snapshotCid: snapshot.contractId, reserveCids, poolAccessCid: acc.poolAccessCid },
+        disclosed
+      );
       await submitTx('MigrationAccept', cmd, 'Accept migration', { estimateTraffic: false });
       setStatus('Migration accepted ✓');
       setSnapshot(null);

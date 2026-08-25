@@ -5,3 +5,4 @@ server/.env
 *.local
 tsconfig.tsbuildinfo
 *.bak.*
+server/.ceremonies/

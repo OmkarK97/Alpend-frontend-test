@@ -10,21 +10,22 @@ import type { DisclosedContract } from '../types';
  *  positions — they survive on-ledger but become unreachable, because every user action requires the
  *  registry CID. Callers MUST check supplyPositionCids/borrowPositionCids are empty first.
  *  Not for production. */
-export function buildArchiveUserPositionCommand(userPositionCid: string): TransactionPayload {
-  return {
-    commands: [
-      {
-        ExerciseCommand: {
-          templateId: `${LENDING_PACKAGE_ID}:Lending.UserPosition:UserPosition`,
-          contractId: userPositionCid,
-          choice: 'Archive',
-          choiceArgument: {},
-        },
-      },
-    ],
-    disclosedContracts: [],
-    packageIdSelectionPreference: [LENDING_PACKAGE_ID],
-  };
+/**
+ * REMOVED — a UserPosition can never be archived.
+ *
+ * TN-03 made the registry `signatory user, poolOperator` and gave it NO archive choice,
+ * precisely because a user archiving their own registry made `LiquidateTS` abort at `fetch`
+ * (permanent liquidation immunity). Co-signing is also what makes NEW-03's
+ * one-canonical-registry-per-user rule enforceable.
+ *
+ * Any "reset registry" flow is therefore impossible by design, not merely unimplemented.
+ * To test migration with a clean party, use a party that has never initialised.
+ */
+export function buildArchiveUserPositionCommand(_userPositionCid: string): never {
+  throw new Error(
+    'UserPosition cannot be archived (TN-03: signatory user + poolOperator, no archive choice). ' +
+    'Use a party that has never initialised instead.'
+  );
 }
 
 /** Accept a MigrationSnapshot with one Loop-wallet signature. Single-controller (`user`);
@@ -33,7 +34,10 @@ export function buildArchiveUserPositionCommand(userPositionCid: string): Transa
  *  so stale-CID drift can't break it). Materializes UserPosition + Deposit/Borrow positions
  *  and bumps the reserve totals atomically — no tokens move (treasury already holds them). */
 export function buildMigrationAcceptCommand(
-  args: { snapshotCid: string; reserveCids: string[] },
+  // RA-07: MigrationAccept CONSUMES a one-shot PoolAccess token (asserts registryInitialized
+  // == False, recreates it True). That is the on-ledger one-registry-per-user guarantee, so the
+  // cid is required — omitting it fails preprocessing with "Missing non-optional fields".
+  args: { snapshotCid: string; reserveCids: string[]; poolAccessCid: string },
   disclosedContracts: DisclosedContract[] = []
 ): TransactionPayload {
   return {
@@ -43,7 +47,7 @@ export function buildMigrationAcceptCommand(
           templateId: `${LENDING_PACKAGE_ID}:Lending.Migration:MigrationSnapshot`,
           contractId: args.snapshotCid,
           choice: 'MigrationAccept',
-          choiceArgument: { reserveCids: args.reserveCids },
+          choiceArgument: { reserveCids: args.reserveCids, poolAccessCid: args.poolAccessCid },
         },
       },
     ],

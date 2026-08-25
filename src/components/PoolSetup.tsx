@@ -492,9 +492,24 @@ export function PoolSetup({ partyId, submitTx, addLog }: Props) {
             } catch (err) {
               addLog('InitializeUserPosition', 'error', `Failed to fetch pool disclosed contracts: ${err}`);
             }
+            // TN-13/RA-07: InitializeUserPosition consumes a PoolAccess token.
+            const accResp = await fetch(
+              `${ADMIN_API_URL}/user/pool-access/${encodeURIComponent(userParty || partyId)}`
+            );
+            const accJson = await accResp.json();
+            const poolAccessCidForInit = accJson.poolAccessCid;
+            if (!poolAccessCidForInit) {
+              addLog('InitializeUserPosition', 'error', accJson.hint || 'No PoolAccess token — grant access first.');
+              return;
+            }
             submitTx(
               'InitializeUserPosition',
-              buildInitializeUserPositionCommand(poolCid, userParty || partyId, poolDisclosed as never[]),
+              buildInitializeUserPositionCommand(
+                poolCid,
+                userParty || partyId,
+                poolAccessCidForInit,
+                poolDisclosed as never[]
+              ),
               `Initialize user position for ${userParty || partyId}`
             );
           }}

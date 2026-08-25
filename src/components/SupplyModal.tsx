@@ -77,10 +77,10 @@ export function SupplyModal({ asset, partyId, position, submitTx, onClose }: Pro
       const effectiveDisclosed = ctx.disclosedContracts
         .filter((dc) => dc.contractId && dc.createdEventBlob)
         .map((dc) => ({
-          templateId: dc.templateId || '',
+          ...(dc.templateId ? { templateId: dc.templateId } : {}),
           contractId: dc.contractId,
           createdEventBlob: dc.createdEventBlob,
-          domainId: dc.domainId || dc.synchronizerId || '',
+          ...(dc.domainId || dc.synchronizerId ? { domainId: dc.domainId || dc.synchronizerId } : {}),
         }));
 
       // Re-resolve current CIDs (reserve/user-position churn between refreshes).

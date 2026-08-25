@@ -10,8 +10,18 @@ const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, '.env') });
 
 const app = express();
+// Ledger state changes under us constantly, so NOTHING from this server may be cached.
+// Express sets an ETag on res.json by default, which made every dashboard poll come back
+// 304 Not Modified — the browser then reused a body captured against a previous pool
+// deployment, so the UI showed a stale UserPosition that no longer existed.
+app.set('etag', false);
 app.use(cors());
 app.use(express.json());
+app.use((_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  next();
+});
 
 const PORT = process.env.PORT || 3100;
 const LEDGER_URL = process.env.LEDGER_URL;
@@ -49,6 +59,11 @@ const READ_PARTY = TARGET_POOL_OPERATOR || POOL_OPERATOR;
 // party (otherwise onboarding one user or a routine consolidation would each need a signing
 // ceremony). Defaults to POOL_OPERATOR for single-key testing.
 const MAINTENANCE_OPERATOR = process.env.MAINTENANCE_OPERATOR_PARTY || POOL_OPERATOR;
+// GOV-01: the committee party that controls every risk-bearing admin choice. This is a
+// DecMan-managed decentralized party — we CANNOT sign for it, and that is the point. Its choices
+// are reached only through GovernableAction proposals confirmed in the DecMan UI. Defaults to the
+// operator so a non-governed deployment behaves exactly as before.
+const GOVERNANCE_PARTY = process.env.GOVERNANCE_PARTY || '';
 
 // Auth0 token cache
 let cachedToken = null;
@@ -129,6 +144,13 @@ const CANTON_PROXY_URL = process.env.CANTON_PROXY_URL || 'http://34.72.196.18:40
  *  Returns factoryId, choiceContext (with amulet-rules, open-round, external-party-config-state),
  *  and all disclosed contracts (including ExternalPartyConfigState).
  *  @param {string} [sender] - sender party (defaults to pool operator) */
+/** Drop templateId for LOCAL submission (this server submits via its own participant, which may
+ *  not hold the splice-amulet version Scan stamps). The blob is self-describing, so the
+ *  participant resolves the contract with whatever compatible version it has. */
+function stripTemplateIds(list) {
+  return (list || []).map(({ templateId, ...rest }) => rest);
+}
+
 async function fetchCCTransferFactory(sender, overrides = {}) {
   // Receiver/sender default to the DEPLOYMENT's poolOperator (READ_PARTY = TARGET_POOL_OPERATOR when set).
   // A supply transfers TO the pool operator, so on the decparty deployment this must be the new party —
@@ -138,7 +160,11 @@ async function fetchCCTransferFactory(sender, overrides = {}) {
   const effectiveSender = sender || poolOperator;
   const dso = `DSO::${(process.env.SYNCHRONIZER_ID || '').split('::')[1] || '1220f22a8b8f2d813c25b9a684dc4dd52b532a0174d8e73a13cdf2baabfff7518337'}`;
 
-  const resp = await fetch(`${CANTON_PROXY_URL}/api/transfer-factory`, {
+  // Amulet's token-standard registry is served by SCAN at its root. CANTON_PROXY_URL was an
+  // older proxy that is no longer configured — an empty value made this fetch a malformed URL
+  // ("fetch failed"). Verified live: /registry/transfer-instruction/v1/transfer-factory.
+  const registryBase = (process.env.SCAN_URL || 'https://scan.sv-1.test.global.canton.network.digitalasset.com').replace(/\/$/, '');
+  const resp = await fetch(`${registryBase}/registry/transfer-instruction/v1/transfer-factory`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(15000),
@@ -356,10 +382,10 @@ function extractContractId(result) {
 app.get('/admin/pool-status', async (req, res) => {
   try {
     const [oracleContracts, poolContracts, reserveContracts, userPosContracts] = await Promise.all([
-      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, READ_PARTY),
-      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, READ_PARTY),
-      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, READ_PARTY),
-      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.Oracle:PriceOracle`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.Pool:LendingPool`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.UserPosition:UserPosition`, READ_PARTY),
     ]);
 
     // TARGET_POOL_OPERATOR pins to a specific deployment when this party sees more than one
@@ -427,16 +453,23 @@ app.post('/admin/create-oracle', async (req, res) => {
       maxStalenessSeconds = 3600,
       liquidationMaxStalenessSeconds = 7200,
       maxDeviationBps = 1000,
-      allowManualPrice = true, // testnet: enables manual SetPrice; deploy false in prod
+      // PRODUCTION DEFAULT: false. With this off, SetPrice is gated and the only way a price
+      // reaches the oracle is PushVerifiedPrice -> Verify against the pinned Chainlink verifier.
+      // That makes the feeder wiring a hard prerequisite for borrow/withdraw — which is the
+      // dependency we want to rehearse, not paper over. Pass true explicitly to override.
+      allowManualPrice = false,
     } = req.body;
     const oraclePusher = process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR;
 
     const commands = [
       {
         CreateCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`,
+          templateId: `#alpend-lending:Lending.Oracle:PriceOracle`,
           createArguments: {
-            poolOperator: POOL_OPERATOR,
+            // The pool/oracle SIGNATORY is the (possibly multisig) operator, NOT the key this
+            // server submits with. Those are different parties in a decparty deployment.
+            poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR,
+            ...(GOVERNANCE_PARTY ? { governanceParty: GOVERNANCE_PARTY } : {}),
             oraclePusher,
             prices: {},
             pendingPrices: {},
@@ -446,22 +479,18 @@ app.post('/admin/create-oracle', async (req, res) => {
             liquidationMaxStalenessSeconds: String(parseInt(liquidationMaxStalenessSeconds)),
             maxDeviationBps: String(parseInt(maxDeviationBps)),
             allowManualPrice,
-            pinnedVerifierCid: null,
-            pinnedVerifierConfigCid: null,
+            // The Chainlink Verifier/VerifierConfig pin moved OUT of PriceOracle into
+            // alpend-oracle-chainlink's ChainlinkPriceFeeder, so alpend-lending carries no
+            // Chainlink dependency (36-dalf closure, none of them Chainlink). Pin it by
+            // creating a feeder: POST /admin/create-feeder.
           },
         },
       },
     ];
 
-    const result = await submitCommand(commands, [POOL_OPERATOR]);
-    const oracleCid = extractContractId(result);
-
-    res.json({
-      success: true,
-      oracleCid,
-      message: 'PriceOracle created. Next: create pool.',
-      updateId: result.transaction?.updateId || result.updateId,
-    });
+    return await operatorAction(res, commands, `#alpend-lending:Lending.Oracle:PriceOracle`,
+      { step: 'PriceOracle', allowManualPrice, oraclePusher,
+        message: 'PriceOracle. Next: create pool.' });
   } catch (e) {
     console.error('CREATE ORACLE error:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -483,11 +512,15 @@ app.post('/admin/create-pool', async (req, res) => {
     const commands = [
       {
         CreateCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending:Lending.Pool:LendingPool`,
           createArguments: {
-            poolOperator: POOL_OPERATOR,
+            poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR,
+            ...(GOVERNANCE_PARTY ? { governanceParty: GOVERNANCE_PARTY } : {}),
             oraclePusher: process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR,
-            treasuryParty: process.env.TREASURY_PARTY || POOL_OPERATOR,
+            // treasuryParty pulls accrued protocol revenue, so it must NOT default to the hot
+            // submitting key — that would let a leaked pusher key drain revenue. Default to the
+            // operator (multisig) instead; override only with a deliberate treasury party.
+            treasuryParty: process.env.TREASURY_PARTY || DECPARTY_OPERATOR || POOL_OPERATOR,
             maintenanceOperator: MAINTENANCE_OPERATOR,
             oracleCid,
             assetReserveCids: [],
@@ -500,15 +533,9 @@ app.post('/admin/create-pool', async (req, res) => {
       },
     ];
 
-    const result = await submitCommand(commands, [POOL_OPERATOR]);
-    const poolContractId = extractContractId(result);
-
-    res.json({
-      success: true,
-      poolContractId,
-      message: 'LendingPool created. Next: add asset reserve, set price, add observers.',
-      updateId: result.transaction?.updateId || result.updateId,
-    });
+    return await operatorAction(res, commands, `#alpend-lending:Lending.Pool:LendingPool`,
+      { step: 'LendingPool', oracleCid,
+        message: 'LendingPool. Next: add asset reserve, wire the feeder, register feeds.' });
   } catch (e) {
     console.error('CREATE POOL error:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -527,12 +554,27 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
 
+    // RA-06 transfer-factory pin. For Amulet/CC the factory + its disclosure come from the env
+    // (Scan-sourced); pass transferFactoryCid/blob explicitly for any other registry.
+    const transferFactoryCid = req.body.transferFactoryCid || process.env.AMULET_TRANSFER_FACTORY_CID;
+    const transferFactoryBlob = req.body.transferFactoryBlob || process.env.AMULET_TRANSFER_FACTORY_BLOB;
+    if (!transferFactoryCid) {
+      return res.status(400).json({ success: false, error: 'transferFactoryCid required (RA-06 pins it at listing time)' });
+    }
+    // NOTE: no templateId here on purpose. Scan stamps its contracts with the CURRENT
+    // splice-amulet version, which this participant may not have — forwarding it fails
+    // JSON_API_PACKAGE_SELECTION_FAILED. The blob alone identifies the contract.
+    const factoryDisclosure = transferFactoryBlob
+      ? [{ contractId: transferFactoryCid, createdEventBlob: transferFactoryBlob,
+           synchronizerId: process.env.SYNCHRONIZER_ID }]
+      : [];
+
     // TN-20: AddAssetReserve now requires the CURRENT cids of every already-registered reserve.
     // The DAR's L-6 duplicate-instrument guard reads each existing reserve's instrumentId, and the
     // pool's STORED cids go stale after any AccrueInterest (each archives + re-creates the reserve).
     // The caller must supply them fresh, covering EXACTLY the registered set. For the first reserve
     // this is []. We resolve the live set from the ledger, scoped to THIS deployment.
-    const allReserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, READ_PARTY);
+    const allReserves = await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, READ_PARTY);
     const currentReserveCids = allReserves
       .filter((c) => !TARGET_POOL_OPERATOR || c?.createArgument?.poolOperator === TARGET_POOL_OPERATOR)
       .map((c) => c.contractId);
@@ -540,12 +582,17 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending:Lending.Pool:LendingPool`,
           contractId: poolContractId,
           choice: 'AddAssetReserve',
           choiceArgument: {
             instrumentAdmin,
             instrumentId,
+            // RA-06: the reserve is PINNED to one transfer factory at listing time, so a rogue
+            // factory can never be substituted per-transfer. AddAssetReserve validates it with
+            // TransferFactory_PublicFetch, which means the factory must also be DISCLOSED —
+            // poolOperator is not a stakeholder on the registry's contract.
+            transferFactoryCid,
             riskParams: {
               ltv: riskParams.ltv,
               liquidationThreshold: riskParams.liquidationThreshold,
@@ -571,6 +618,13 @@ app.post('/admin/add-asset-reserve', async (req, res) => {
       },
     ];
 
+    return await operatorAction(res, commands, `#alpend-lending:Lending.AssetReserve:AssetReserve`,
+      { step: `AddAssetReserve ${instrumentId?.id || ''}`, currentReserveCids, transferFactoryCid,
+        warning: 'AddAssetReserve calls getTime — the prepared tx expires in tens of seconds. '
+               + 'Stage both sign commands before executing.' },
+      factoryDisclosure);
+
+    /* eslint-disable no-unreachable */
     const result = await submitCommand(commands, [POOL_OPERATOR]);
 
     // AddAssetReserve returns (ContractId LendingPool, ContractId AssetReserve)
@@ -611,7 +665,7 @@ app.post('/admin/set-price', async (req, res) => {
     // SetPrice is a consuming choice — the oracle CID changes on every call. Resolve the
     // CURRENT active PriceOracle instead of trusting a possibly-stale CID from the caller
     // (setting a second price would otherwise hit the archived oracle from the first).
-    const oracles = await queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
+    const oracles = await queryContracts(`#alpend-lending:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
     const oracleCid = oracles.length ? oracles[oracles.length - 1].contractId : passedCid;
     if (!oracleCid) {
       return res.status(404).json({ success: false, error: 'No active PriceOracle found' });
@@ -620,7 +674,7 @@ app.post('/admin/set-price', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`,
+          templateId: `#alpend-lending:Lending.Oracle:PriceOracle`,
           contractId: oracleCid,
           choice: 'SetPrice',
           choiceArgument: {
@@ -641,12 +695,12 @@ app.post('/admin/set-price', async (req, res) => {
     let updatedPoolCid = null;
     if (newOracleCid) {
       try {
-        const poolContracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR);
+        const poolContracts = await queryContracts(`#alpend-lending:Lending.Pool:LendingPool`, POOL_OPERATOR);
         const latestPool = poolContracts[poolContracts.length - 1];
         if (latestPool?.contractId) {
           const updateCmd = [{
             ExerciseCommand: {
-              templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+              templateId: `#alpend-lending:Lending.Pool:LendingPool`,
               contractId: latestPool.contractId,
               choice: 'UpdateOracleCid',
               choiceArgument: { newOracleCid },
@@ -684,7 +738,7 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
 
     // Auto-detect if not provided
     if (!newOracleCid) {
-      const oracleContracts = await queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
+      const oracleContracts = await queryContracts(`#alpend-lending:Lending.Oracle:PriceOracle`, POOL_OPERATOR);
       const latestOracle = oracleContracts[oracleContracts.length - 1];
       if (!latestOracle?.contractId) {
         return res.status(400).json({ success: false, error: 'No oracle contract found' });
@@ -692,7 +746,7 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
       newOracleCid = latestOracle.contractId;
     }
     if (!poolContractId) {
-      const poolContracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR);
+      const poolContracts = await queryContracts(`#alpend-lending:Lending.Pool:LendingPool`, POOL_OPERATOR);
       const latestPool = poolContracts[poolContracts.length - 1];
       if (!latestPool?.contractId) {
         return res.status(400).json({ success: false, error: 'No pool contract found' });
@@ -702,7 +756,7 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
 
     const commands = [{
       ExerciseCommand: {
-        templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+        templateId: `#alpend-lending:Lending.Pool:LendingPool`,
         contractId: poolContractId,
         choice: 'UpdateOracleCid',
         choiceArgument: { newOracleCid },
@@ -725,6 +779,102 @@ app.post('/admin/update-oracle-ref', async (req, res) => {
   }
 });
 
+/** POST /user/grant-access — onboard a wallet to THIS pool.
+ *  Body: { user }  (the connected party id; pool is resolved server-side)
+ *
+ *  GrantPoolAccess is controlled by maintenanceOperator — a HOT key, deliberately NOT the
+ *  multisig poolOperator, so self-serve signup doesn't cost an M-of-N ceremony. It cannot move
+ *  funds: the worst a leaked key does is let an unvetted party use the protocol.
+ *
+ *  RA-07: `registryInitialized` states whether the user ALREADY has a UserPosition registry.
+ *  The contract cannot look this up (no keys, no ACS query), so the grantor must assert it.
+ *  We check the ledger here rather than trusting the caller — passing `true` for a genuinely
+ *  new user leaves them unable to initialise, and `false` for an existing one is the ONE
+ *  remaining way to hand somebody a second registry. */
+app.post('/user/grant-access', async (req, res) => {
+  try {
+    const { user } = req.body;
+    if (!user) return res.status(400).json({ success: false, error: 'user (party id) is required' });
+
+    const pool = await currentPoolContract();
+    if (!pool?.contractId) return res.status(400).json({ success: false, error: 'no LendingPool found for this deployment' });
+
+    // IDEMPOTENT. GrantPoolAccess is nonconsuming, so calling it twice mints a SECOND one-shot
+    // token — and that is a real hazard, not just clutter: once MigrationAccept (or
+    // InitializeUserPosition) spends one, the leftover can be spent on the other, giving the user
+    // a SECOND UserPosition registry. That is exactly the NEW-03 failure RA-07's one-shot token
+    // exists to prevent, and the DAR cannot catch it (no keys, no ACS query — the grantor asserts
+    // registryInitialized). So refuse to mint when an unused token is already outstanding.
+    const existing = targetFilter(await queryContracts(`#alpend-lending:Lending.Pool:PoolAccess`, READ_PARTY))
+      .filter((c) => c?.createArgument?.user === user);
+    const unused = existing.find((c) => c?.createArgument?.registryInitialized === false);
+    if (unused && !req.body.force) {
+      return res.json({
+        success: true, user, reused: true,
+        poolAccessCid: unused.contractId,
+        registryInitialized: false,
+        outstanding: existing.length,
+        next: 'Already granted — go straight to InitializeUserPosition / MigrationAccept.',
+        note: 'Not minting a second token: two unused tokens let one user create two registries (NEW-03). Pass {"force":true} only if you know why you need another.',
+      });
+    }
+
+    // Does this user already hold a UserPosition in THIS deployment?
+    const positions = targetFilter(await queryContracts(`#alpend-lending:Lending.UserPosition:UserPosition`, READ_PARTY))
+      .filter((c) => c?.createArgument?.user === user);
+    const registryInitialized = positions.length > 0;
+
+    const result = await submitCommand([{ ExerciseCommand: {
+      templateId: `#alpend-lending:Lending.Pool:LendingPool`,
+      contractId: pool.contractId,
+      choice: 'GrantPoolAccess',
+      choiceArgument: { user, registryInitialized },
+    } }], [MAINTENANCE_OPERATOR]);
+
+    res.json({
+      success: true,
+      user,
+      poolAccessCid: extractContractId(result),
+      registryInitialized,
+      grantedBy: MAINTENANCE_OPERATOR,
+      next: registryInitialized
+        ? 'User already has a registry — go straight to supply.'
+        : 'Now exercise InitializeUserPosition from the wallet, then supply.',
+      updateId: result.transaction?.updateId || result.updateId,
+    });
+  } catch (e) {
+    console.error('GRANT ACCESS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** GET /user/pool-access/:party — the user's PoolAccess token, if any.
+ *  InitializeUserPosition consumes an UNINITIALISED one (registryInitialized = false), so we
+ *  return that in preference to an already-initialised token. PV-01: scoped to the requesting
+ *  party only — never surface another user's access contract. */
+app.get('/user/pool-access/:party', async (req, res) => {
+  try {
+    const user = decodeURIComponent(req.params.party);
+    const all = targetFilter(await queryContracts(`#alpend-lending:Lending.Pool:PoolAccess`, READ_PARTY))
+      .filter((c) => c?.createArgument?.user === user);
+    const uninitialised = all.find((c) => c?.createArgument?.registryInitialized === false);
+    const chosen = uninitialised || all[all.length - 1];
+    res.json({
+      success: true,
+      user,
+      poolAccessCid: chosen?.contractId || null,
+      registryInitialized: chosen?.createArgument?.registryInitialized ?? null,
+      count: all.length,
+      hint: chosen
+        ? (uninitialised ? 'Ready for InitializeUserPosition.' : 'Token already used — this wallet has a registry.')
+        : 'No PoolAccess — run POST /user/grant-access first.',
+    });
+  } catch (e) {
+    console.error('POOL ACCESS lookup error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 /** POST /admin/add-observer — grant a user access to the pool.
  *  Post-audit the pool's shared observer list was replaced by per-user PoolAccess
  *  contracts (PV-01): this now exercises GrantPoolAccess, which is *nonconsuming*
@@ -742,10 +892,11 @@ app.post('/admin/add-observer', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending:Lending.Pool:LendingPool`,
           contractId: poolContractId,
           choice: 'GrantPoolAccess',
-          choiceArgument: { user: newObserver },
+          // RA-07 added registryInitialized; omitting it fails against the current DAR.
+          choiceArgument: { user: newObserver, registryInitialized: req.body.registryInitialized ?? false },
         },
       },
     ];
@@ -786,12 +937,22 @@ app.get('/admin/cc-transfer-context', async (req, res) => {
     // Map response to frontend format
     const transferFactoryCid = data.factoryId;
     const choiceContext = data.choiceContext?.choiceContextData || { values: {} };
+    // KEEP templateId. Two submission paths, opposite requirements:
+    //  - Loop wallet (the UI): the SDK REQUIRES templateId on every disclosed contract. Omitting
+    //    it decodes as "" and the ledger rejects "Invalid identifier format ()". Loop's own
+    //    participant runs the current splice-amulet, so Scan's version resolves there fine.
+    //  - This server submitting via palladium: palladium may NOT have that splice-amulet version,
+    //    and forwarding it fails JSON_API_PACKAGE_SELECTION_FAILED "Package-id … not known".
+    // So we pass the registry's value through untouched and let each submitter decide; the
+    // server-side callers strip it (see stripTemplateIds) before submitting locally.
     const disclosedContracts = (data.choiceContext?.disclosedContracts || []).map((dc) => ({
-      templateId: dc.templateId,
+      ...(dc.templateId ? { templateId: dc.templateId } : {}),
       contractId: dc.contractId,
       createdEventBlob: dc.createdEventBlob,
-      domainId: dc.synchronizerId || '',
+      synchronizerId: dc.synchronizerId || process.env.SYNCHRONIZER_ID || '',
+      domainId: dc.synchronizerId || process.env.SYNCHRONIZER_ID || '',
     }));
+
 
     console.log('CC transfer context built:', {
       transferFactoryCid: transferFactoryCid?.substring(0, 40),
@@ -879,10 +1040,21 @@ app.get('/admin/cc-holdings/:party', async (req, res) => {
 });
 
 /** GET /admin/asset-reserves — query existing AssetReserve contracts */
+app.get('/admin/asset-reserves', async (req, res) => {
+  try {
+    const templateId = `#alpend-lending:Lending.AssetReserve:AssetReserve`;
+    const contracts = targetFilter(await queryContracts(templateId, READ_PARTY));
+    res.json({ success: true, contracts });
+  } catch (e) {
+    console.error('QUERY ASSET RESERVES error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 /** GET /admin/pool-access/:party — does this party hold a PoolAccess grant? (PV-01 membership check) */
 app.get('/admin/pool-access/:party', async (req, res) => {
   try {
-    const contracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:PoolAccess`, READ_PARTY);
+    const contracts = await queryContracts(`#alpend-lending:Lending.Pool:PoolAccess`, READ_PARTY);
     // PRIVACY: only ever the requesting party's own grant — never expose others'. The cid is needed
     // as the poolAccessCid argument to SupplyTSWithPosition / BorrowTSWithPosition (TN-13).
     const own = contracts.find((c) => c.createArgument?.user === req.params.party);
@@ -898,48 +1070,33 @@ app.post('/admin/revoke-pool-access', async (req, res) => {
   try {
     const { party } = req.body;
     if (!party) return res.status(400).json({ success: false, error: 'party is required' });
-    const contracts = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:PoolAccess`, READ_PARTY);
-    const grant = contracts.find((c) => c.createArgument?.user === party);
-    if (!grant) return res.json({ success: true, revoked: false, message: 'No PoolAccess grant for this party' });
-    await submitCommand(
-      [
-        {
-          ExerciseCommand: {
-            templateId: `#alpend-lending-final-loop:Lending.Pool:PoolAccess`,
-            contractId: grant.contractId,
-            choice: 'RevokePoolAccess',
-            choiceArgument: {},
-          },
-        },
-      ],
-      [POOL_OPERATOR]
-    );
-    res.json({ success: true, revoked: true });
+    const grants = targetFilter(await queryContracts(`#alpend-lending:Lending.Pool:PoolAccess`, READ_PARTY))
+      .filter((c) => c.createArgument?.user === party);
+    if (!grants.length) return res.json({ success: true, revoked: false, message: 'No PoolAccess grant for this party' });
+
+    // Target a SPECIFIC token. A party can legitimately hold two (an unused one plus the
+    // initialised one recreated by InitializeUserPosition/MigrationAccept), and revoking the
+    // wrong one is the difference between cleaning up a NEW-03 hazard and cutting off a live
+    // user. Default to the UNUSED token, since that is the one that can mint a second registry.
+    const chosen = req.body.poolAccessCid
+      ? grants.find((c) => c.contractId === req.body.poolAccessCid)
+      : (grants.find((c) => c.createArgument?.registryInitialized === false) || grants[0]);
+    if (!chosen) return res.status(400).json({ success: false, error: 'poolAccessCid not found for this party' });
+
+    // RevokePoolAccess is `controller poolOperator` — the multisig — so this is a ceremony.
+    return await operatorAction(res, [{ ExerciseCommand: {
+      templateId: `#alpend-lending:Lending.Pool:PoolAccess`,
+      contractId: chosen.contractId, choice: 'RevokePoolAccess', choiceArgument: {},
+    } }], `#alpend-lending:Lending.Pool:PoolAccess`,
+      { step: 'RevokePoolAccess', party, poolAccessCid: chosen.contractId,
+        registryInitialized: chosen.createArgument?.registryInitialized,
+        outstanding: grants.length });
   } catch (e) {
     console.error('REVOKE POOL ACCESS error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-app.get('/admin/asset-reserves', async (req, res) => {
-  try {
-    const templateId = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
-    const contracts = targetFilter(await queryContracts(templateId, READ_PARTY));
-    res.json({ success: true, contracts });
-  } catch (e) {
-    console.error('QUERY ASSET RESERVES error:', e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-/** POST /admin/refresh-holdings — reconcile a reserve's on-chain custody.
- *  The reserve's stored `reserveHoldingCids` drift over time (holdings get archived by
- *  merges/decay/manual transfers), and `totalLiquidity` drifts above the real balance via
- *  holding-fee decay. This exercises `AssetReserve.RefreshHoldings` with the pool operator's
- *  CURRENT live holdings of the asset — re-pointing `reserveHoldingCids` at live contracts and
- *  rebooking `totalLiquidity` from the real amounts — then updates the pool's reserve reference
- *  (RefreshHoldings is consuming, so the reserve CID changes). Body: { instrumentIdId } e.g. "USDCx" / "Amulet".
- */
 app.post('/admin/refresh-holdings', async (req, res) => {
   try {
     const { instrumentIdId } = req.body;
@@ -948,7 +1105,7 @@ app.post('/admin/refresh-holdings', async (req, res) => {
     }
 
     // Resolve the current reserve for this instrument (+ its feed id, for the pool re-point).
-    const reserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
+    const reserves = await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
     const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
     if (!reserve) {
       return res.status(404).json({ success: false, error: `No AssetReserve found for instrument ${instrumentIdId}` });
@@ -978,7 +1135,7 @@ app.post('/admin/refresh-holdings', async (req, res) => {
     const refreshResult = await submitCommand([
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`,
+          templateId: `#alpend-lending:Lending.AssetReserve:AssetReserve`,
           contractId: reserve.contractId,
           choice: 'RefreshHoldings',
           choiceArgument: { freshHoldingCids },
@@ -990,13 +1147,13 @@ app.post('/admin/refresh-holdings', async (req, res) => {
     // Re-point the pool at the new reserve CID (feed-keyed).
     let newPoolCid = null;
     if (newReserveCid && feedId) {
-      const pools = await queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, POOL_OPERATOR);
+      const pools = await queryContracts(`#alpend-lending:Lending.Pool:LendingPool`, POOL_OPERATOR);
       const pool = pools[pools.length - 1];
       if (pool?.contractId) {
         const upd = await submitCommand([
           {
             ExerciseCommand: {
-              templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+              templateId: `#alpend-lending:Lending.Pool:LendingPool`,
               contractId: pool.contractId,
               choice: 'UpdateAssetReserveCid',
               choiceArgument: { feedId, newReserveCid },
@@ -1029,8 +1186,8 @@ app.post('/admin/refresh-holdings', async (req, res) => {
  *  re-point the pool at the new reserve CID (feed-keyed). Shared by update-risk-params /
  *  update-interest-params (RefreshHoldings has its own copy with holdings-specific logic). */
 async function exerciseReserveChoiceAndRepoint(instrumentIdId, choice, choiceArgument) {
-  const RESERVE_TID = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
-  const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+  const RESERVE_TID = `#alpend-lending:Lending.AssetReserve:AssetReserve`;
+  const POOL_TID = `#alpend-lending:Lending.Pool:LendingPool`;
   const reserves = await queryContracts(RESERVE_TID, POOL_OPERATOR);
   const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
   if (!reserve) throw new Error(`No AssetReserve found for instrument ${instrumentIdId}`);
@@ -1065,7 +1222,7 @@ app.post('/admin/update-risk-params', async (req, res) => {
       return res.status(400).json({ success: false, error: 'instrumentIdId, ltv, liquidationThreshold, liquidationBonus are required' });
     }
     // Resolve the current reserve to preserve its (immutable-here) priceFeedId + defaults.
-    const reserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
+    const reserves = await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
     const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
     if (!reserve) return res.status(404).json({ success: false, error: `No AssetReserve found for ${instrumentIdId}` });
     const cur = reserve.createArgument.riskParams;
@@ -1119,12 +1276,16 @@ app.post('/admin/update-interest-params', async (req, res) => {
 app.post('/admin/set-pause-flags', async (req, res) => {
   try {
     const { pauseDeposits = false, pauseWithdrawals = false, pauseBorrows = false, pauseLiquidations = false } = req.body;
-    const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+    const POOL_TID = `#alpend-lending:Lending.Pool:LendingPool`;
     const pools = await queryContracts(POOL_TID, POOL_OPERATOR);
     const pool = pools[pools.length - 1];
     if (!pool?.contractId) return res.status(404).json({ success: false, error: 'No active LendingPool found' });
 
-    const result = await submitCommand([
+    // SetPauseFlags is `controller poolOperator`, so it MUST go through operatorAction: when the
+    // operator is an external multisig the hot submitting key has no authority and a direct
+    // submitCommand fails DAML_AUTHORIZATION_ERROR. This is the emergency brake — it has to work
+    // under a threshold party, which is exactly when it is most likely to be needed.
+    const commands = [
       {
         ExerciseCommand: {
           templateId: POOL_TID,
@@ -1138,14 +1299,11 @@ app.post('/admin/set-pause-flags', async (req, res) => {
           },
         },
       },
-    ], [POOL_OPERATOR]);
-    const newPoolCid = extractContractId(result);
-    console.log(`SetPauseFlags: dep=${!!pauseDeposits} wd=${!!pauseWithdrawals} bor=${!!pauseBorrows} liq=${!!pauseLiquidations}, pool=${newPoolCid}`);
-    res.json({
-      success: true,
+    ];
+    return await operatorAction(res, commands, POOL_TID, {
+      step: 'SetPauseFlags',
       pauseFlags: { pauseDeposits: !!pauseDeposits, pauseWithdrawals: !!pauseWithdrawals, pauseBorrows: !!pauseBorrows, pauseLiquidations: !!pauseLiquidations },
-      newPoolCid,
-      updateId: result.transaction?.updateId || result.updateId,
+      previousPoolCid: pool.contractId,
     });
   } catch (e) {
     console.error('SET PAUSE FLAGS error:', e.message);
@@ -1193,8 +1351,8 @@ app.post('/admin/withdraw-revenue', async (req, res) => {
     if (instrumentIdId !== 'Amulet') {
       return res.status(400).json({ success: false, error: 'Only Amulet (CC) revenue withdrawal is wired currently' });
     }
-    const RESERVE_TID = `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`;
-    const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+    const RESERVE_TID = `#alpend-lending:Lending.AssetReserve:AssetReserve`;
+    const POOL_TID = `#alpend-lending:Lending.Pool:LendingPool`;
 
     const reserves = await queryContracts(RESERVE_TID, POOL_OPERATOR);
     const reserve = reserves.filter((r) => r.createArgument?.instrumentId?.id === instrumentIdId).slice(-1)[0];
@@ -1284,7 +1442,7 @@ app.post('/admin/write-off-bad-debt', async (req, res) => {
     if (!borrower || !instrumentIdId) {
       return res.status(400).json({ success: false, error: 'borrower and instrumentIdId (debt asset) are required' });
     }
-    const P = `#alpend-lending-final-loop:Lending.`;
+    const P = `#alpend-lending:Lending.`;
     const RESERVE_TID = `${P}AssetReserve:AssetReserve`;
     const POOL_TID = `${P}Pool:LendingPool`;
 
@@ -1356,8 +1514,8 @@ app.post('/admin/write-off-bad-debt', async (req, res) => {
 /** Exercise a consuming choice on the current PriceOracle, then re-point the pool at the new
  *  oracle CID (Oracle choices churn the CID). Shared by set-verifier / register-feed / push-price. */
 async function exerciseOracleChoiceAndRepoint(choice, choiceArgument, actAs = [POOL_OPERATOR]) {
-  const ORACLE_TID = `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`;
-  const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+  const ORACLE_TID = `#alpend-lending:Lending.Oracle:PriceOracle`;
+  const POOL_TID = `#alpend-lending:Lending.Pool:LendingPool`;
   // TARGET_POOL_OPERATOR pins pool/oracle selection to a SPECIFIC deployment. Needed once this
   // pusher party (POOL_OPERATOR) can see more than one deployment's contracts — e.g. a decparty
   // deployment where POOL_OPERATOR is only the oraclePusher/observer. There "last active" is
@@ -1400,22 +1558,378 @@ async function exerciseOracleChoiceAndRepoint(choice, choiceArgument, actAs = [P
   return { newOracleCid, newPoolCid, updateId: result.transaction?.updateId || result.updateId };
 }
 
-/** POST /admin/set-verifier — pin the canonical Chainlink Verifier + VerifierConfig (SetVerifier,
- *  poolOperator). Body: { verifierCid, verifierConfigCid } (contract CIDs, from Chainlink). */
-app.post('/admin/set-verifier', async (req, res) => {
+// ── oracle/pool resolution shared by the feeder push path ────────────────────
+// Same selection rule as exerciseOracleChoiceAndRepoint: prefer the oracle the POOL points at,
+// because after a rebuild there can be more than one active PriceOracle and picking the stale
+// one would push prices nowhere useful.
+const _ownedByTarget = (c) =>
+  !process.env.TARGET_POOL_OPERATOR || c?.createArgument?.poolOperator === process.env.TARGET_POOL_OPERATOR;
+
+async function currentPoolContract() {
+  const pools = (await queryContracts(`#alpend-lending:Lending.Pool:LendingPool`, READ_PARTY)).filter(_ownedByTarget);
+  return pools[pools.length - 1];
+}
+const currentPoolCid = async () => (await currentPoolContract())?.contractId;
+
+async function currentOracleContract() {
+  const pool = await currentPoolContract();
+  const oracles = (await queryContracts(`#alpend-lending:Lending.Oracle:PriceOracle`, READ_PARTY)).filter(_ownedByTarget);
+  return oracles.find((o) => o.contractId === pool?.createArgument?.oracleCid) || oracles[oracles.length - 1];
+}
+const currentOracleCid = async () => (await currentOracleContract())?.contractId;
+
+/** Does the current oracle carry a price for EVERY feed the pool has a reserve for?
+ *  This is exactly FIND-014's assert inside UpdateOracleCid — checking it first is what lets us
+ *  pass poolCid for an atomic retarget only when it will actually succeed. Mirrors resolvePrice:
+ *  direct key first, then the registered alias. */
+async function everyFeedPriced() {
+  const oracle = await currentOracleContract();
+  if (!oracle) return false;
+  const prices = oracle.createArgument?.prices || {};
+  const aliases = oracle.createArgument?.feedAliases || {};
+  const reserves = (await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, READ_PARTY)).filter(_ownedByTarget);
+  if (!reserves.length) return false;
+  return reserves.every((r) => {
+    const f = r.createArgument?.riskParams?.priceFeedId;
+    return f && (prices[f] !== undefined || (aliases[f] && prices[aliases[f]] !== undefined));
+  });
+}
+
+async function repointPoolOracle(newOracleCid) {
+  const pool = await currentPoolContract();
+  if (!pool?.contractId) throw new Error('no LendingPool to repoint');
+  const upd = await submitCommand([{ ExerciseCommand: {
+    templateId: `#alpend-lending:Lending.Pool:LendingPool`, contractId: pool.contractId,
+    choice: 'UpdateOracleCid', choiceArgument: { newOracleCid },
+  } }], [process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR]);
+  return extractContractId(upd);
+}
+
+// ── Chainlink feeder (alpend-oracle-chainlink) ───────────────────────────────
+// SetVerifier is GONE from PriceOracle. The verifier pin now lives on ChainlinkPriceFeeder
+// in a separate DAR, which is why alpend-lending has no Chainlink dependency. The feeder is
+// `signatory poolOperator` and its PushVerifiedPrice choice is `controller oraclePusher`, so
+// exercising it runs with poolOperator authority — that is what lets it reach the
+// poolOperator-controlled RecordVerifiedPrice on the oracle. A leaked oraclePusher key still
+// cannot write a price without passing Verify.
+const FEEDER_TEMPLATE = `#alpend-oracle-chainlink:Oracle.Chainlink:ChainlinkPriceFeeder`;
+
+// ── 2-of-2 ceremony engine (interactive submission) ──────────────────────────
+// This server submits with a SINGLE ledger token, so it cannot actAs an external M-of-N
+// poolOperator. Those choices go: prepare -> sign on EACH key holder's box -> execute.
+// Keys never touch this server; it only assembles the two signatures.
+// DECPARTY_OPERATOR is the external party (defaults to TARGET_POOL_OPERATOR when that differs
+// from our submitting key). SIGNER{1,2}_FP are the PROTOCOL key fingerprints (psk1/psk2).
+const DECPARTY_OPERATOR = process.env.DECPARTY_OPERATOR
+  || (TARGET_POOL_OPERATOR && TARGET_POOL_OPERATOR !== POOL_OPERATOR ? TARGET_POOL_OPERATOR : null);
+// The operator party's signing threshold decides how many signatures an execute needs, and that is
+// a property of the PARTY, not of this server: our self-managed party is `partySigningKeys
+// threshold 2` (psk1 + psk2), while a DecMan-created party can be threshold 1 with a single usable
+// key. So the signer set is a list, ordered, and the count is whatever is configured — not a
+// hardcoded pair. Signatures supplied at execute must be in THIS order.
+const SIGNER_FPS = [
+  process.env.SIGNER1_FP, process.env.SIGNER2_FP,
+  process.env.SIGNER3_FP, process.env.SIGNER4_FP,
+].filter(Boolean);
+const SIG_FORMAT = process.env.SIG_FORMAT || 'SIGNATURE_FORMAT_CONCAT';
+const SIG_SPEC = process.env.SIG_SPEC || 'SIGNING_ALGORITHM_SPEC_ED25519';
+const S1_BOX = process.env.SIGNER1_BOX || 'palladium';
+const S1_KEY = process.env.SIGNER1_KEY || 'psk1.priv.pem';
+const S2_BOX = process.env.SIGNER2_BOX || 'ibex';
+const S2_KEY = process.env.SIGNER2_KEY || 'psk2.priv.pem';
+const LEDGER_USER_ID = process.env.LEDGER_USER_ID
+  || (CLIENT_ID ? `${CLIENT_ID}@clients` : null);
+
+// Prepared txs persist: each represents real two-box human work, and nodemon/--watch restarts
+// would otherwise discard a ceremony mid-flight.
+const CER_DIR = join(__dirname, '.ceremonies');
+const ceremonies = new Map();
+(function loadCeremonies() {
   try {
-    const { verifierCid, verifierConfigCid } = req.body;
+    fsMkdirSync(CER_DIR, { recursive: true });
+    for (const f of fsReaddirSync(CER_DIR).filter((n) => n.endsWith('.json'))) {
+      try { ceremonies.set(f.replace(/\.json$/, ''), JSON.parse(fsReadFileSync(join(CER_DIR, f), 'utf8'))); } catch {}
+    }
+  } catch {}
+})();
+const cerSave = (id, v) => { try { fsMkdirSync(CER_DIR, { recursive: true }); fsWriteFileSync(join(CER_DIR, `${id}.json`), JSON.stringify(v)); } catch {} };
+const cerDrop = (id) => { try { const p = join(CER_DIR, `${id}.json`); if (fsExistsSync(p)) fsUnlinkSync(p); } catch {} };
+
+const needsCeremony = (actAs) =>
+  !!DECPARTY_OPERATOR && (Array.isArray(actAs) ? actAs : [actAs]).includes(DECPARTY_OPERATOR);
+
+async function startCeremony({ commands, disclosedContracts = [], label, watchTemplate }) {
+  if (!LEDGER_USER_ID) throw new Error('ceremony needs LEDGER_USER_ID (or CLIENT_ID to derive it)');
+  if (!process.env.SYNCHRONIZER_ID) throw new Error('ceremony needs SYNCHRONIZER_ID');
+  const token = await getToken();
+  const resp = await fetch(`${LEDGER_URL}/v2/interactive-submission/prepare`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userId: LEDGER_USER_ID,
+      commandId: `cer-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      actAs: [DECPARTY_OPERATOR], readAs: [],
+      synchronizerId: process.env.SYNCHRONIZER_ID,
+      commands, disclosedContracts, verboseHashing: false,
+      ...(LENDING_PACKAGE_ID ? { packageIdSelectionPreference: [LENDING_PACKAGE_ID] } : {}),
+    }),
+  });
+  const txt = await resp.text();
+  if (!resp.ok) throw new Error(`prepare ${resp.status}: ${txt.slice(0, 400)}`);
+  const prepared = JSON.parse(txt);
+  const hashB64 = prepared.preparedTransactionHash;
+  if (!hashB64) throw new Error('prepare returned no preparedTransactionHash');
+  const id = label || `cer-${Date.now().toString(36)}`;
+  const rec = { prepared, hashB64, watchTemplate, createdAt: new Date().toISOString(),
+    // Keep the raw commands: executeCeremony needs each ExerciseCommand's target contractId to
+    // verify the transaction actually committed (see the note there).
+    rawCommands: commands,
+    commands: commands.map((c) => Object.keys(c)[0] + ':' + (c.ExerciseCommand?.choice || c.CreateCommand?.templateId || '')) };
+  ceremonies.set(id, rec); cerSave(id, rec);
+  return {
+    ceremony: id, hashB64,
+    // Signing hints are generated from the CONFIGURED signer set, not a hardcoded pair — a
+    // threshold-1 operator gets one box and one signature; a 2-of-2 gets the palladium->ibex chain.
+    signaturesRequired: SIGNER_FPS.length,
+    ...(SIGNER_FPS.length === 1
+      ? {
+          run_on: `${S1_BOX}: atd '${hashB64}' '${id}'`,
+          setup: {
+            once: `atd () { local H="$1" L="$2"; [ -f ${S1_KEY} ] || { echo "NO KEY at ${S1_KEY} (wrong user?)"; return 1; }; echo -n "$H" | base64 -d > "$HOME/h.bin"; local S=$(openssl pkeyutl -sign -inkey ${S1_KEY} -rawin -in "$HOME/h.bin" | base64 -w0); [ -z "$S" ] && { echo SIGN_FAILED; return 1; }; printf '\\n===== PASTE ON YOUR MAC =====\\n'; echo "curl -sS -X POST http://localhost:${PORT}/ceremony/execute -H 'Content-Type: application/json' -d '{\\"label\\":\\"$L\\",\\"sigs\\":[\\"$S\\"]}'"; }`,
+          },
+          boxes: { sig1: S1_BOX },
+        }
+      : {
+          run_on_palladium: `alp1 '${hashB64}' '${id}'`,
+          setup: {
+            palladium_once: `alp1 () { local H="$1" L="$2"; local S1=$(echo -n "$H" | base64 -d > "$HOME/h.bin"; openssl pkeyutl -sign -inkey ${S1_KEY} -rawin -in "$HOME/h.bin" | base64 -w0); [ -z "$S1" ] && { echo SIGN_FAILED; return 1; }; printf '\\n===== PASTE ON ${S2_BOX.toUpperCase()} =====\\n'; echo "alp2 '$H' '$L' '$S1'"; }`,
+            ibex_once: `alp2 () { local H="$1" L="$2" S1="$3"; local S2=$(echo -n "$H" | base64 -d > "$HOME/h.bin"; openssl pkeyutl -sign -inkey ${S2_KEY} -rawin -in "$HOME/h.bin" | base64 -w0); [ -z "$S2" ] && { echo SIGN_FAILED; return 1; }; printf '\\n===== PASTE ON YOUR MAC =====\\n'; echo "curl -sS -X POST http://localhost:${PORT}/ceremony/execute -H 'Content-Type: application/json' -d '{\\"label\\":\\"$L\\",\\"sig1\\":\\"$S1\\",\\"sig2\\":\\"$S2\\"}'"; }`,
+          },
+          boxes: { sig1: S1_BOX, sig2: S2_BOX },
+        }),
+  };
+}
+
+async function executeCeremony(id, sigs) {
+  const c = ceremonies.get(id);
+  if (!c) throw new Error(`unknown ceremony '${id}' — re-run prepare`);
+  if (!SIGNER_FPS.length) throw new Error('no signer fingerprints configured (set SIGNER1_FP[, SIGNER2_FP, ...])');
+  if (sigs.length !== SIGNER_FPS.length) {
+    throw new Error(`this operator needs ${SIGNER_FPS.length} signature(s), got ${sigs.length}`);
+  }
+  const mk = (s, fp) => ({ format: SIG_FORMAT, signature: s, signedBy: fp, signingAlgorithmSpec: SIG_SPEC });
+  const token = await getToken();
+  // Offset BEFORE submitting, so we can find our own completion afterwards.
+  const beginOffset = await (async () => {
+    try {
+      const r = await fetch(`${LEDGER_URL}/v2/state/ledger-end`, { headers: { Authorization: `Bearer ${token}` } });
+      return (await r.json()).offset;
+    } catch { return null; }
+  })();
+  const submissionId = `cer-${id}`;
+  const resp = await fetch(`${LEDGER_URL}/v2/interactive-submission/execute`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      preparedTransaction: c.prepared.preparedTransaction,
+      hashingSchemeVersion: c.prepared.hashingSchemeVersion,
+      userId: LEDGER_USER_ID,
+      submissionId,
+      deduplicationPeriod: { Empty: {} },
+      partySignatures: { signatures: [{ party: DECPARTY_OPERATOR, signatures: sigs.map((s, i) => mk(s, SIGNER_FPS[i])) }] },
+    }),
+  });
+  const txt = await resp.text();
+  if (!resp.ok) throw new Error(`execute ${resp.status}: ${txt.slice(0, 400)}`);
+  ceremonies.delete(id); cerDrop(id);
+
+  // ── VERIFY THE TRANSACTION ACTUALLY COMMITTED ───────────────────────────────────────────────
+  // `/v2/interactive-submission/execute` is ASYNCHRONOUS: HTTP 200 means the submission was
+  // ACCEPTED, not that the transaction committed. Rejections (LOCAL_VERDICT_INACTIVE_CONTRACTS when
+  // something else consumed the target first, authorization failures, ...) are delivered on the
+  // COMPLETION stream and never appear in that response.
+  //
+  // Do NOT infer success from "the exercised contract is now archived" — that is satisfied when a
+  // COMPETING transaction archived it, which is precisely the failure mode here (the oracle push
+  // loop rotates the pool on every price push). That heuristic produced a false `verified: true` on
+  // an unpause that never landed. The only sound signal is our own completion, matched on
+  // submissionId. There is no execute-and-wait on this JSON API build.
+  let verified = null, commitError = null, updateId = null;
+  if (beginOffset != null) {
+    const parties = [DECPARTY_OPERATOR, POOL_OPERATOR].filter(Boolean);
+    for (let i = 0; i < 20 && verified === null; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const cr = await fetch(`${LEDGER_URL}/v2/commands/completions`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: LEDGER_USER_ID, parties, beginExclusive: beginOffset }),
+        });
+        if (!cr.ok) break;                       // endpoint shape differs — fall through to null
+        const rows = await cr.json();
+        for (const row of (Array.isArray(rows) ? rows : [])) {
+          const comp = row?.completionResponse?.Completion?.value || row?.Completion?.value || row?.completion;
+          if (!comp || comp.submissionId !== submissionId) continue;
+          const st = comp.status || {};
+          if (!st.code) { verified = true; updateId = comp.updateId || null; }
+          else { verified = false; commitError = `${st.code}: ${String(st.message || '').slice(0, 300)}`; }
+          break;
+        }
+      } catch { break; }
+    }
+  }
+
+  let created = [];
+  if (c.watchTemplate) {
+    for (let i = 0; i < 20 && !created.length; i++) {
+      const now = targetFilter(await queryContracts(c.watchTemplate, READ_PARTY));
+      created = now.map((x) => x.contractId).filter((cid) => !(c.before || []).includes(cid));
+      if (!created.length) await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  if (verified === false) console.error(`CEREMONY ${id}: REJECTED — ${commitError}`);
+  if (verified === null) console.warn(`CEREMONY ${id}: could not confirm commit (no matching completion) — verify on-ledger`);
+  return {
+    created,
+    verified,
+    ...(updateId ? { updateId } : {}),
+    ...(verified === false ? {
+      error: `Transaction did NOT commit — ${commitError}`,
+      hint: 'If this is INACTIVE_CONTRACTS, something consumed the target first — usually the oracle '
+        + 'push loop (it rotates the pool on every price push). Stop it, then re-prepare.',
+    } : {}),
+    ...(verified === null ? { warning: 'Commit unconfirmed — check on-ledger state before trusting this.' } : {}),
+    raw: txt ? JSON.parse(txt) : {},
+  };
+}
+
+/** Run a poolOperator command: ceremony when the operator is an external multisig,
+ *  direct single-token submit otherwise. */
+async function operatorAction(res, commands, watchTemplate, extra = {}, disclosedContracts = []) {
+  if (needsCeremony([DECPARTY_OPERATOR])) {
+    const before = watchTemplate
+      ? targetFilter(await queryContracts(watchTemplate, READ_PARTY)).map((x) => x.contractId) : [];
+    const cer = await startCeremony({ commands, disclosedContracts, watchTemplate });
+    const rec = ceremonies.get(cer.ceremony); rec.before = before; cerSave(cer.ceremony, rec);
+    return res.json({ success: true, ceremonyRequired: true, ...extra, ...cer });
+  }
+  const result = await submitCommand(commands, [POOL_OPERATOR], disclosedContracts);
+  return res.json({ success: true, ...extra, updateId: result.transaction?.updateId, created: extractContractId(result) });
+}
+
+app.post('/ceremony/prepare', async (req, res) => {
+  try {
+    const { commands, disclosedContracts = [], label, watchTemplate } = req.body;
+    if (!Array.isArray(commands) || !commands.length) return res.status(400).json({ success: false, error: 'need commands[]' });
+    res.json({ success: true, ...(await startCeremony({ commands, disclosedContracts, label, watchTemplate })) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/ceremony/execute', async (req, res) => {
+  try {
+    const { label, sigs, sig1, sig2 } = req.body;
+    // Accept either an explicit `sigs` array or the legacy sig1/sig2 pair.
+    const list = Array.isArray(sigs) ? sigs.filter(Boolean) : [sig1, sig2].filter(Boolean);
+    if (!label || !list.length) {
+      return res.status(400).json({ success: false,
+        error: `need label and ${SIGNER_FPS.length} signature(s) — pass sigs: [...] or sig1/sig2` });
+    }
+    res.json({ success: true, label, ...(await executeCeremony(label, list)) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/ceremony/list', (_req, res) => res.json({ success: true,
+  operator: DECPARTY_OPERATOR, submittingAs: POOL_OPERATOR, signaturesRequired: SIGNER_FPS.length,
+  pending: [...ceremonies.entries()].map(([k, v]) => ({ label: k, createdAt: v.createdAt, hashB64: v.hashB64, commands: v.commands })) }));
+
+async function currentFeederCid() {
+  const cs = await queryContracts(FEEDER_TEMPLATE, READ_PARTY);
+  const mine = cs.filter((c) => !TARGET_POOL_OPERATOR || c?.createArgument?.poolOperator === TARGET_POOL_OPERATOR);
+  return mine.slice(-1)[0]?.contractId;
+}
+
+/** POST /admin/rotate-oracle-pusher — repoint BOTH the oracle and the pool at a new
+ *  oraclePusher party. Body: { newOraclePusher? } (defaults to ORACLE_PUSHER_PARTY).
+ *
+ *  Both must move together: PriceOracle has `observer oraclePusher` (so the bot can SEE the
+ *  oracle it writes to) and Pool.UpdateOracleCid asserts
+ *  `newOracle.oraclePusher == oraclePusher`, so a mismatch bricks every retarget.
+ *
+ *  Two ceremonies, deliberately not batched: each choice is consuming and returns a new cid,
+ *  and Canton's interactive submission prepares ONE command at a time. Run oracle first, then
+ *  pool — the pool's assert reads the oracle. */
+app.post('/admin/rotate-oracle-pusher', async (req, res) => {
+  try {
+    const newOraclePusher = req.body.newOraclePusher || process.env.ORACLE_PUSHER_PARTY;
+    const target = req.body.target; // 'oracle' | 'pool'
+    if (!newOraclePusher) return res.status(400).json({ success: false, error: 'newOraclePusher required' });
+    if (target !== 'oracle' && target !== 'pool') {
+      return res.status(400).json({ success: false, error: "target must be 'oracle' or 'pool' (run oracle first)" });
+    }
+
+    if (target === 'oracle') {
+      const oracle = await currentOracleContract();
+      if (!oracle?.contractId) return res.status(400).json({ success: false, error: 'no PriceOracle found' });
+      return await operatorAction(res, [{ ExerciseCommand: {
+        templateId: `#alpend-lending:Lending.Oracle:PriceOracle`, contractId: oracle.contractId,
+        choice: 'RotateOraclePusher', choiceArgument: { newOraclePusher },
+      } }], `#alpend-lending:Lending.Oracle:PriceOracle`,
+        { step: 'RotateOraclePusher (oracle)', newOraclePusher, from: oracle.contractId,
+          next: 'then target=pool' });
+    }
+
+    const pool = await currentPoolContract();
+    if (!pool?.contractId) return res.status(400).json({ success: false, error: 'no LendingPool found' });
+    return await operatorAction(res, [{ ExerciseCommand: {
+      templateId: `#alpend-lending:Lending.Pool:LendingPool`, contractId: pool.contractId,
+      choice: 'UpdateOraclePusher', choiceArgument: { newOraclePusher },
+    } }], `#alpend-lending:Lending.Pool:LendingPool`,
+      { step: 'UpdateOraclePusher (pool)', newOraclePusher, from: pool.contractId });
+  } catch (e) {
+    console.error('ROTATE ORACLE PUSHER error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/create-feeder — genesis the ChainlinkPriceFeeder (replaces SetVerifier).
+ *  Body: { verifierCid, verifierConfigCid, expectedConfigOwner? } */
+app.post('/admin/create-feeder', async (req, res) => {
+  try {
+    const { verifierCid, verifierConfigCid, expectedConfigOwner } = req.body;
     if (!verifierCid || !verifierConfigCid) {
       return res.status(400).json({ success: false, error: 'verifierCid and verifierConfigCid are required' });
     }
-    const out = await exerciseOracleChoiceAndRepoint('SetVerifier', {
-      newVerifierCid: verifierCid,
-      newVerifierConfigCid: verifierConfigCid,
-    });
-    console.log(`SetVerifier: oracle=${out.newOracleCid}, pool=${out.newPoolCid}`);
-    res.json({ success: true, ...out });
+    const createArguments = {
+      poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR,
+      oraclePusher: process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR,
+      verifierCid, verifierConfigCid,
+      // Whose VerifierConfig we require. Pinned as a field, not passed per call — a
+      // caller-supplied expectation is no expectation at all (same reasoning as RA-06).
+      expectedConfigOwner: expectedConfigOwner || process.env.CHAINLINK_CONFIG_OWNER || POOL_OPERATOR,
+    };
+    return await operatorAction(res, [{ CreateCommand: { templateId: FEEDER_TEMPLATE, createArguments } }],
+      FEEDER_TEMPLATE, { step: 'ChainlinkPriceFeeder', args: createArguments,
+        next: 'POST /admin/push-price { feedId }' });
   } catch (e) {
-    console.error('SET VERIFIER error:', e.message);
+    console.error('CREATE FEEDER error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/rotate-verifier — re-pin the verifier/config pair (poolOperator).
+ *  Must exist from genesis: a Splice hard-domain migration makes the pinned cid stale, and
+ *  migration is one-way, so without rotation the pool would have to be redeployed. */
+app.post('/admin/rotate-verifier', async (req, res) => {
+  try {
+    const { verifierCid, verifierConfigCid } = req.body;
+    const feederCid = req.body.feederCid || await currentFeederCid();
+    if (!feederCid) return res.status(400).json({ success: false, error: 'no ChainlinkPriceFeeder — create one first' });
+    return await operatorAction(res, [{ ExerciseCommand: { templateId: FEEDER_TEMPLATE, contractId: feederCid,
+      choice: 'RotateVerifier',
+      choiceArgument: { newVerifierCid: verifierCid, newVerifierConfigCid: verifierConfigCid } } }],
+      FEEDER_TEMPLATE, { step: 'RotateVerifier', feederCid });
+  } catch (e) {
+    console.error('ROTATE VERIFIER error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -1425,13 +1939,33 @@ app.post('/admin/set-verifier', async (req, res) => {
  *  rawFeedId "0x0003111e1c2212376d4c196bf7635919e4b28368809dda6f515c396453d53770". */
 app.post('/admin/register-feed', async (req, res) => {
   try {
-    const { label, rawFeedId } = req.body;
+    const { label } = req.body;
+    // Known TESTNET Data Streams ids (mainnet ids 404 against the testnet host).
+    const KNOWN = {
+      'cc-feed': '00031de3179f870b857f273a3496c5a76795aec28f984f243b51fd8aaf759c55',
+      'usdcx-feed': '0003dc85e8b01946bf9dfd8b0db860129181eb6105a8c8981d9f28e00b6f60d9',
+    };
+    let rawFeedId = req.body.rawFeedId || KNOWN[label];
     if (!label || !rawFeedId) {
-      return res.status(400).json({ success: false, error: 'label and rawFeedId are required' });
+      return res.status(400).json({ success: false, error: `label required (+ rawFeedId unless one of: ${Object.keys(KNOWN).join(', ')})` });
     }
-    const out = await exerciseOracleChoiceAndRepoint('RegisterFeed', { label, rawFeedId });
-    console.log(`RegisterFeed: ${label} -> ${rawFeedId}, oracle=${out.newOracleCid}`);
-    res.json({ success: true, label, rawFeedId, ...out });
+    // The alias VALUE must equal the key UpdatePrice stores under — report.feedId, no 0x prefix.
+    rawFeedId = rawFeedId.startsWith('0x') ? rawFeedId.slice(2) : rawFeedId;
+    if (!rawFeedId.startsWith('0003')) {
+      return res.status(400).json({ success: false, error: `rawFeedId must be a V3 feed id (0003 prefix), got ${rawFeedId.slice(0, 8)}…` });
+    }
+    const oracle = await currentOracleContract();
+    if (!oracle?.contractId) return res.status(400).json({ success: false, error: 'no PriceOracle found' });
+
+    // NOTE: no repoint here. RegisterFeed rotates the oracle cid, but FIND-014 makes
+    // UpdateOracleCid assert a price exists for EVERY configured feed — which is false until
+    // the first push lands. Repointing happens as part of the first PushVerifiedPrice instead.
+    return await operatorAction(res, [{ ExerciseCommand: {
+      templateId: `#alpend-lending:Lending.Oracle:PriceOracle`, contractId: oracle.contractId,
+      choice: 'RegisterFeed', choiceArgument: { label, rawFeedId },
+    } }], `#alpend-lending:Lending.Oracle:PriceOracle`,
+      { step: `RegisterFeed ${label}`, label, rawFeedId, oracleCid: oracle.contractId,
+        note: 'pool NOT repointed — happens on the first successful price push (FIND-014)' });
   } catch (e) {
     console.error('REGISTER FEED error:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -1445,9 +1979,39 @@ app.post('/admin/register-feed', async (req, res) => {
  *  the manual endpoint + the continuous loop. Requires verifier pinned + feed registered. */
 async function pushFeed(feedId) {
   const report = await fetchSignedReport(feedId);
-  // signedReportBytes is BytesHex — passed straight to the DAR, which verifies + decodes on-chain.
-  const out = await exerciseOracleChoiceAndRepoint('UpdatePrice', { signedReportBytes: report.fullReport }, [POOL_OPERATOR]);
-  return { feedId: report.feedId, decodedPrice: report.decoded?.price, ...out };
+  const feederCid = await currentFeederCid();
+  if (!feederCid) throw new Error('no ChainlinkPriceFeeder — POST /admin/create-feeder first');
+  const oracleCid = await currentOracleCid();
+  if (!oracleCid) throw new Error('no PriceOracle found');
+
+  // PushVerifiedPrice: Verify -> parse V3 -> validFrom/expiresAt window -> RecordVerifiedPrice.
+  // poolCid is OPTIONAL and that optionality is load-bearing: passing it retargets the pool in the
+  // SAME transaction (no window where the pool points at an archived oracle), but FIND-014 makes
+  // UpdateOracleCid assert a price exists for EVERY configured feed — so during bootstrap, before
+  // every feed has a price, pass None or the push deadlocks on the price it is trying to write.
+  const poolCid = await currentPoolCid().catch(() => null);
+  const includePool = poolCid && (await everyFeedPriced().catch(() => false));
+
+  const result = await submitCommand([{ ExerciseCommand: {
+    templateId: FEEDER_TEMPLATE, contractId: feederCid, choice: 'PushVerifiedPrice',
+    choiceArgument: {
+      oracleCid,
+      signedReportBytes: report.fullReport,   // BytesHex — verified + decoded on-chain
+      poolCid: includePool ? poolCid : null,
+    },
+  } }], [process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR]);
+
+  const newOracleCid = (result.transaction?.events || [])
+    .map((e) => e.CreatedEvent).find((c) => c?.templateId?.includes('PriceOracle'))?.contractId;
+  // If we did not retarget atomically, the pool still points at the archived oracle — repoint now.
+  let newPoolCid = null;
+  if (!includePool && newOracleCid) {
+    newPoolCid = await repointPoolOracle(newOracleCid).catch((e) => {
+      console.warn(`pushFeed: repoint deferred (${e.message}) — expected until every feed is priced`);
+      return null;
+    });
+  }
+  return { feedId: report.feedId, decodedPrice: report.decoded?.price, newOracleCid, newPoolCid, atomicRetarget: !!includePool };
 }
 
 app.post('/admin/push-price', async (req, res) => {
@@ -1479,8 +2043,8 @@ app.post('/admin/push-price', async (req, res) => {
  *  requires a resolvable price for every configured reserve feed, so the repoint must come last). */
 app.post('/admin/rebuild-oracle', async (req, res) => {
   try {
-    const ORACLE_TID = `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`;
-    const POOL_TID = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+    const ORACLE_TID = `#alpend-lending:Lending.Oracle:PriceOracle`;
+    const POOL_TID = `#alpend-lending:Lending.Pool:LendingPool`;
     const feeds = req.body.feeds;
     if (!Array.isArray(feeds) || feeds.length === 0) {
       return res.status(400).json({ success: false, error: 'feeds [{label, rawFeedId}] required' });
@@ -1495,9 +2059,11 @@ app.post('/admin/rebuild-oracle', async (req, res) => {
     const cur = oracles.find((o) => o.contractId === curOracleCid) || oracles[oracles.length - 1];
     if (!cur?.createArgument) throw new Error('Could not read current oracle params');
     const c = cur.createArgument;
-    if (!c.pinnedVerifierCid || !c.pinnedVerifierConfigCid) {
-      throw new Error('Current oracle has no pinned verifier — run set-verifier first');
-    }
+    // The verifier pin is no longer on the oracle — it lives on ChainlinkPriceFeeder in
+    // alpend-oracle-chainlink. A fresh oracle needs no pin; it just needs a feeder to exist
+    // so prices can be pushed into it.
+    const feederCid = await currentFeederCid();
+    if (!feederCid) throw new Error('No ChainlinkPriceFeeder — run POST /admin/create-feeder first');
 
     // Alias value MUST equal the DAR-stored price key (report.feedId, no 0x prefix).
     const stripHex = (s) => (s.startsWith('0x') ? s.slice(2) : s);
@@ -1518,24 +2084,26 @@ app.post('/admin/rebuild-oracle', async (req, res) => {
           liquidationMaxStalenessSeconds: c.liquidationMaxStalenessSeconds,
           maxDeviationBps: c.maxDeviationBps,
           allowManualPrice: false,
-          pinnedVerifierCid: c.pinnedVerifierCid,
-          pinnedVerifierConfigCid: c.pinnedVerifierConfigCid,
         },
       } },
     ], [POOL_OPERATOR]);
     let oracleCid = extractContractId(createRes);
     if (!oracleCid) throw new Error('Fresh oracle create returned no contract id');
 
-    // 2. Push each feed's live price. UpdatePrice churns the oracle cid → chain it.
+    // 2. Push each feed's live price through the FEEDER (Verify happens there now).
+    //    RecordVerifiedPrice churns the oracle cid → chain it. poolCid stays None for every
+    //    push here: the pool is repointed ONCE in step 3, because FIND-014 rejects a retarget
+    //    until the fresh oracle carries a price for every configured feed.
     const pushed = [];
     for (const f of feeds) {
       const report = await fetchSignedReport(f.rawFeedId);
       const upd = await submitCommand([
         { ExerciseCommand: {
-          templateId: ORACLE_TID, contractId: oracleCid,
-          choice: 'UpdatePrice', choiceArgument: { signedReportBytes: report.fullReport },
+          templateId: FEEDER_TEMPLATE, contractId: feederCid,
+          choice: 'PushVerifiedPrice',
+          choiceArgument: { oracleCid, signedReportBytes: report.fullReport, poolCid: null },
         } },
-      ], [POOL_OPERATOR]);
+      ], [process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR]);
       oracleCid = extractContractId(upd);
       pushed.push({ label: f.label, storedFeedId: report.feedId, price: report.decoded?.price });
     }
@@ -1618,6 +2186,237 @@ app.get('/admin/oracle-push/status', (req, res) => {
   res.json({ success: true, enabled: oraclePush.enabled, intervalMs: oraclePush.intervalMs, feeds: oraclePush.feeds, last: oraclePush.last });
 });
 
+// ── RA-14 batch migration ────────────────────────────────────────────────────
+// MigrationBatcher exists so N snapshots cost ONE poolOperator ceremony instead of N.
+// It is a separate template (not a choice on LendingPool) for two reasons: Migration imports
+// Pool for PoolAccess, so a choice there is an import cycle; and the pool cid churns on every
+// oracle retarget, whereas the batcher is nonconsuming and its cid never rotates.
+//
+// BatchCreateMigrationSnapshots is TIME-INDEPENDENT by construction (no getTime; expiresAt is
+// an argument), so it gets Canton's ~24h preparation-time tolerance — a relaxed two-box
+// ceremony even with hundreds of entries.
+const BATCHER_TEMPLATE = `#alpend-lending:Lending.Migration:MigrationBatcher`;
+
+app.get('/admin/batcher', async (_req, res) => {
+  try {
+    const cs = targetFilter(await queryContracts(BATCHER_TEMPLATE, READ_PARTY));
+    res.json({ success: true, count: cs.length, batcherCid: cs[cs.length - 1]?.contractId || null });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GOV-01 — governance proposals (DecMan confirms/executes) + approval redemption
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Division of labour, and WHY it is split this way:
+//   * We create the proposal here (any party may be `proposer`; it is the proposal's only
+//     signatory). DecMan cannot build arbitrary contracts — its POST /contracts takes only a
+//     fixed governance vocabulary — so the proposal has to originate from a real ledger client.
+//   * The COMMITTEE confirms and executes it in the DecMan UI. We cannot do that half: we hold no
+//     key for the governance party, by design.
+//   * Execution of a risk-bearing action does NOT hit the pool directly — it mints an *Approval*
+//     (see Alpend.Governance.Approvals). The operator then redeems that approval here, supplying
+//     cids that are fresh at submit time. Proposals expire in 24h (DecMan ACTION TIMEOUT 1.0 d)
+//     while approvals live 7 days, so a vote is never lost to cid churn.
+const GOV_ACTIONS_PKG = process.env.GOV_ACTIONS_PACKAGE || '#alpend-governance-actions';
+const GOV_PROPOSER = process.env.GOV_PROPOSER_PARTY || POOL_OPERATOR;
+
+const PROPOSAL_TEMPLATES = {
+  SetPauseFlags:            'Alpend.Governance.Actions:SetPauseFlagsProposal',
+  UpdateOraclePusher:       'Alpend.Governance.Actions:UpdateOraclePusherProposal',
+  UpdateTreasuryParty:      'Alpend.Governance.Actions:UpdateTreasuryPartyProposal',
+  UpdateGovernanceParty:    'Alpend.Governance.Actions:UpdateGovernancePartyProposal',
+  AddAssetReserve:          'Alpend.Governance.Actions:AddAssetReserveProposal',
+  WriteOffBadDebt:          'Alpend.Governance.Actions:WriteOffBadDebtProposal',
+  UpdateRiskParams:         'Alpend.Governance.Actions:UpdateRiskParamsProposal',
+  UpdateInterestRateParams: 'Alpend.Governance.Actions:UpdateInterestRateParamsProposal',
+  UpdateTransferFactory:    'Alpend.Governance.Actions:UpdateTransferFactoryProposal',
+  UpdateReserveGovernance:  'Alpend.Governance.Actions:UpdateReserveGovernanceProposal',
+  RegisterFeed:             'Alpend.Governance.Actions:RegisterFeedProposal',
+  SetPrice:                 'Alpend.Governance.Actions:SetPriceProposal',
+  RotateOraclePusher:       'Alpend.Governance.Actions:RotateOraclePusherProposal',
+  UpdateOracleGovernance:   'Alpend.Governance.Actions:UpdateOracleGovernanceProposal',
+};
+
+const APPROVAL_REDEEM = {
+  AddAssetReserveApproval:      'RedeemAddAssetReserve',
+  WriteOffBadDebtApproval:      'RedeemWriteOffBadDebt',
+  RiskParamsApproval:           'RedeemRiskParams',
+  InterestRateParamsApproval:   'RedeemInterestRateParams',
+  TransferFactoryApproval:      'RedeemTransferFactory',
+  ReserveGovernanceApproval:    'RedeemReserveGovernance',
+  RegisterFeedApproval:         'RedeemRegisterFeed',
+  SetPriceApproval:             'RedeemSetPrice',
+  RotateOraclePusherApproval:   'RedeemRotateOraclePusher',
+  OracleGovernanceApproval:     'RedeemOracleGovernance',
+};
+
+/** GET /admin/gov/actions — what can be proposed, and the current governance party. */
+app.get('/admin/gov/actions', (_req, res) => {
+  res.json({
+    success: true,
+    governanceParty: GOVERNANCE_PARTY || null,
+    proposer: GOV_PROPOSER,
+    actions: Object.keys(PROPOSAL_TEMPLATES),
+    approvals: Object.keys(APPROVAL_REDEEM),
+  });
+});
+
+/** POST /admin/gov/propose — create a GovernableAction proposal for the committee to confirm.
+ *  Body: { action: 'SetPauseFlags', args: { ... } }
+ *  `governanceParty`, `proposer` and `poolOperator` are filled in automatically. */
+app.post('/admin/gov/propose', async (req, res) => {
+  try {
+    const { action, args = {} } = req.body || {};
+    const entity = PROPOSAL_TEMPLATES[action];
+    if (!entity) {
+      return res.status(400).json({ success: false,
+        error: `Unknown action '${action}'. Known: ${Object.keys(PROPOSAL_TEMPLATES).join(', ')}` });
+    }
+    if (!GOVERNANCE_PARTY) {
+      return res.status(400).json({ success: false,
+        error: 'GOVERNANCE_PARTY is not set — this deployment has no committee to propose to.' });
+    }
+    const templateId = `${GOV_ACTIONS_PKG}:${entity}`;
+    const createArguments = {
+      governanceParty: GOVERNANCE_PARTY,
+      proposer: GOV_PROPOSER,
+      // Only the two-phase proposals carry poolOperator (it becomes the approval's redeemer);
+      // the direct ones ignore an extra field, so send it only when the caller did not.
+      ...(entity.includes('SetPauseFlagsProposal') || entity.includes('UpdateOraclePusherProposal')
+          || entity.includes('UpdateTreasuryPartyProposal') || entity.includes('UpdateGovernancePartyProposal')
+          ? {} : { poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR }),
+      ...args,
+    };
+    // The proposal's ONLY signatory is the proposer, so this is a plain single-sig submit — no
+    // ceremony, even when poolOperator is a multisig.
+    const result = await submitCommand([{ CreateCommand: { templateId, createArguments } }], [GOV_PROPOSER]);
+    res.json({
+      success: true, action, templateId,
+      proposalCid: extractContractId(result),
+      updateId: result.transaction?.updateId,
+      next: 'Confirm it in the DecMan UI (both members), then execute. NOTE: DecMan ACTION TIMEOUT is 1 day.',
+    });
+  } catch (e) {
+    console.error('GOV PROPOSE error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** GET /admin/gov/approvals — live approvals awaiting operator redemption. */
+app.get('/admin/gov/approvals', async (_req, res) => {
+  try {
+    const out = [];
+    for (const name of Object.keys(APPROVAL_REDEEM)) {
+      const tid = `${GOV_ACTIONS_PKG}:Alpend.Governance.Approvals:${name}`;
+      try {
+        const cs = targetFilter(await queryContracts(tid, READ_PARTY));
+        for (const c of cs) out.push({ approval: name, contractId: c.contractId, payload: c.payload ?? c.createArgument });
+      } catch { /* template absent from this deployment — skip */ }
+    }
+    res.json({ success: true, count: out.length, approvals: out });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/gov/redeem — operator redeems a committee approval with FRESH cids.
+ *  Body: { approval: 'RiskParamsApproval', approvalCid, args: { reserveCid } } */
+app.post('/admin/gov/redeem', async (req, res) => {
+  try {
+    const { approval, approvalCid, args = {} } = req.body || {};
+    const choice = APPROVAL_REDEEM[approval];
+    if (!choice) {
+      return res.status(400).json({ success: false,
+        error: `Unknown approval '${approval}'. Known: ${Object.keys(APPROVAL_REDEEM).join(', ')}` });
+    }
+    if (!approvalCid) return res.status(400).json({ success: false, error: 'approvalCid is required' });
+    const commands = [{ ExerciseCommand: {
+      templateId: `${GOV_ACTIONS_PKG}:Alpend.Governance.Approvals:${approval}`,
+      contractId: approvalCid,
+      choice,
+      choiceArgument: args,
+    } }];
+    // Redemption is controlled by poolOperator, so it goes through the normal ceremony path.
+    return await operatorAction(res, commands, null, { step: `${choice}` });
+  } catch (e) {
+    console.error('GOV REDEEM error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/create-batcher — genesis the MigrationBatcher (once per deployment). */
+app.post('/admin/create-batcher', async (_req, res) => {
+  try {
+    return await operatorAction(res, [{ CreateCommand: {
+      templateId: BATCHER_TEMPLATE,
+      createArguments: { poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR },
+    } }], BATCHER_TEMPLATE, { step: 'MigrationBatcher' });
+  } catch (e) {
+    console.error('CREATE BATCHER error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /admin/batch-create-snapshots — ONE ceremony, N MigrationSnapshots.
+ *  Body: { entries: [{ user, collaterals:[{instrumentIdId, realizedPrincipal, isUsedAsCollateral?}],
+ *                      borrows:[{instrumentIdId, realizedDebt}] }], expiresInDays? }
+ *
+ *  Asset ids are resolved to full instrumentIds from the LIVE reserves, so a typo fails here
+ *  rather than producing a snapshot nobody can accept. */
+app.post('/admin/batch-create-snapshots', async (req, res) => {
+  try {
+    const { entries, expiresInDays = 7 } = req.body;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ success: false, error: 'entries[] required' });
+    }
+    let batcherCid = req.body.batcherCid;
+    if (!batcherCid) {
+      const cs = targetFilter(await queryContracts(BATCHER_TEMPLATE, READ_PARTY));
+      batcherCid = cs[cs.length - 1]?.contractId;
+    }
+    if (!batcherCid) return res.status(400).json({ success: false, error: 'no MigrationBatcher — POST /admin/create-batcher first' });
+
+    const reserves = targetFilter(await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, READ_PARTY));
+    const instrById = {};
+    for (const r of reserves) {
+      const iid = r.createArgument?.instrumentId;
+      if (iid?.id) instrById[iid.id] = { admin: iid.admin, id: iid.id };
+    }
+    const resolve = (id) => {
+      if (!instrById[id]) throw new Error(`No reserve for "${id}". Available: ${Object.keys(instrById).join(', ') || '(none)'}`);
+      return instrById[id];
+    };
+
+    const migrationEntries = entries.map((e) => ({
+      user: e.user,
+      collaterals: (e.collaterals || []).map((c) => ({
+        instrumentId: resolve(c.instrumentIdId),
+        realizedPrincipal: String(c.realizedPrincipal),
+        isUsedAsCollateral: c.isUsedAsCollateral ?? true,
+      })),
+      borrows: (e.borrows || []).map((b) => ({
+        instrumentId: resolve(b.instrumentIdId),
+        realizedDebt: String(b.realizedDebt),
+      })),
+    }));
+    const expiresAt = new Date(Date.now() + expiresInDays * 86400000).toISOString();
+
+    return await operatorAction(res, [{ ExerciseCommand: {
+      templateId: BATCHER_TEMPLATE, contractId: batcherCid,
+      choice: 'BatchCreateMigrationSnapshots',
+      choiceArgument: { entries: migrationEntries, expiresAt },
+    } }], `#alpend-lending:Lending.Migration:MigrationSnapshot`,
+      { step: `BatchCreateMigrationSnapshots ×${migrationEntries.length}`, expiresAt, batcherCid,
+        users: migrationEntries.map((e) => e.user.slice(0, 24) + '…'),
+        timing: 'time-INDEPENDENT (no getTime) — relaxed ~24h ceremony window' });
+  } catch (e) {
+    console.error('BATCH SNAPSHOTS error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 /** POST /admin/create-migration-snapshot — operator prepares a per-user MigrationSnapshot from
  *  (mock or real) legacy data. Operator-signed, user-observer; the user later accepts it with one
  *  Loop signature (MigrationAccept). No tokens move — the treasury already holds them.
@@ -1637,7 +2436,7 @@ app.post('/admin/create-migration-snapshot', async (req, res) => {
     // Refuse to issue a snapshot for anyone who already has a UserPosition — whether from a
     // prior migration or InitializeUserPosition. See Lending/Migration.daml NEW-03.
     if (!allowExistingRegistry) {
-      const existing = await queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, POOL_OPERATOR);
+      const existing = await queryContracts(`#alpend-lending:Lending.UserPosition:UserPosition`, POOL_OPERATOR);
       const mine = existing.filter((u) => u.createArgument?.user === user);
       if (mine.length > 0) {
         return res.status(409).json({
@@ -1649,7 +2448,7 @@ app.post('/admin/create-migration-snapshot', async (req, res) => {
     }
 
     // Resolve each asset's full instrumentId (admin + id) from the live reserves.
-    const reserves = await queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
+    const reserves = await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, POOL_OPERATOR);
     const instrById = {};
     for (const r of reserves) {
       const iid = r.createArgument?.instrumentId;
@@ -1675,9 +2474,9 @@ app.post('/admin/create-migration-snapshot', async (req, res) => {
     const result = await submitCommand([
       {
         CreateCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Migration:MigrationSnapshot`,
+          templateId: `#alpend-lending:Lending.Migration:MigrationSnapshot`,
           createArguments: {
-            poolOperator: POOL_OPERATOR,
+            poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR,
             user,
             collaterals: snapCollaterals,
             borrows: snapBorrows,
@@ -1713,7 +2512,7 @@ app.post('/admin/cancel-migration-snapshot', async (req, res) => {
     await submitCommand([
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Migration:MigrationSnapshot`,
+          templateId: `#alpend-lending:Lending.Migration:MigrationSnapshot`,
           contractId: snapshotCid,
           choice: 'MigrationCancel',
           choiceArgument: {},
@@ -1731,11 +2530,87 @@ app.post('/admin/cancel-migration-snapshot', async (req, res) => {
  *  so the frontend can show the accept prompt. */
 app.get('/admin/migration-snapshot/:party', async (req, res) => {
   try {
-    const snaps = await queryContracts(`#alpend-lending-final-loop:Lending.Migration:MigrationSnapshot`, POOL_OPERATOR);
-    const mine = snaps.filter((s) => s.createArgument?.user === req.params.party);
-    res.json({ success: true, snapshots: mine });
+    // Read as READ_PARTY (the deployment's poolOperator): MigrationSnapshot is
+    // `signatory poolOperator, observer user`, so the submitting/pusher key is NOT a
+    // stakeholder and querying as it silently returns nothing.
+    const snaps = targetFilter(await queryContracts(`#alpend-lending:Lending.Migration:MigrationSnapshot`, READ_PARTY));
+    const party = decodeURIComponent(req.params.party);
+    const mine = snaps.filter((c) => c.createArgument?.user === party);
+    res.json({
+      success: true,
+      count: mine.length,
+      snapshots: mine.map((c) => ({
+        contractId: c.contractId,
+        // Keep the raw payload: MigrationBanner reads snapshot.createArgument directly.
+        createArgument: c.createArgument,
+        expiresAt: c.createArgument?.expiresAt,
+        collaterals: (c.createArgument?.collaterals || []).map((x) => ({
+          id: x.instrumentId?.id, realizedPrincipal: x.realizedPrincipal, isUsedAsCollateral: x.isUsedAsCollateral })),
+        borrows: (c.createArgument?.borrows || []).map((x) => ({
+          id: x.instrumentId?.id, realizedDebt: x.realizedDebt })),
+      })),
+    });
   } catch (e) {
     console.error('QUERY MIGRATION SNAPSHOT error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/** POST /user/accept-migration — exercise MigrationAccept as the USER.
+ *  Body: { user, snapshotCid? } (snapshot resolved if omitted)
+ *
+ *  Two things the DAR requires that are easy to miss:
+ *   1. reserveCids must cover EVERY instrument in the snapshot, else it aborts
+ *      "Migration: no reserve supplied for instrument …". Passing extras is harmless, a
+ *      subset is not — so we pass them all.
+ *   2. The reserves must be DISCLOSED. AssetReserve is `signatory poolOperator` with no
+ *      observer, so the accepting user is not a stakeholder and the submit otherwise fails
+ *      CONTRACT_NOT_FOUND on a cid that plainly exists.
+ *  Reserve cids also ROTATE on every accept (RecordDeposit is consuming), so they are
+ *  re-resolved live here rather than cached. */
+app.post('/user/accept-migration', async (req, res) => {
+  try {
+    const { user } = req.body;
+    if (!user) return res.status(400).json({ success: false, error: 'user required' });
+
+    let snapshotCid = req.body.snapshotCid;
+    if (!snapshotCid) {
+      const snaps = targetFilter(await queryContracts(`#alpend-lending:Lending.Migration:MigrationSnapshot`, READ_PARTY))
+        .filter((c) => c.createArgument?.user === user);
+      snapshotCid = snaps[snaps.length - 1]?.contractId;
+    }
+    if (!snapshotCid) return res.status(400).json({ success: false, error: `no MigrationSnapshot for ${user}` });
+
+    const accResp = targetFilter(await queryContracts(`#alpend-lending:Lending.Pool:PoolAccess`, READ_PARTY))
+      .filter((c) => c.createArgument?.user === user);
+    const poolAccessCid = req.body.poolAccessCid
+      || accResp.find((c) => c.createArgument?.registryInitialized === false)?.contractId;
+    if (!poolAccessCid) return res.status(400).json({ success: false, error: `no unused PoolAccess for ${user} — grant access first (RA-07)` });
+
+    const reserves = targetFilter(await queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, READ_PARTY));
+    const reserveCids = reserves.map((r) => r.contractId);
+    const disclosed = reserves
+      .filter((r) => r.createdEventBlob)
+      .map((r) => ({
+        contractId: r.contractId,
+        createdEventBlob: r.createdEventBlob,
+        synchronizerId: process.env.SYNCHRONIZER_ID,
+        ...(r.templateId ? { templateId: r.templateId } : {}),
+      }));
+
+    const result = await submitCommand([{ ExerciseCommand: {
+      templateId: `#alpend-lending:Lending.Migration:MigrationSnapshot`,
+      contractId: snapshotCid, choice: 'MigrationAccept',
+      choiceArgument: { reserveCids, poolAccessCid },
+    } }], [user], disclosed);
+
+    res.json({
+      success: true, user, snapshotCid, poolAccessCid,
+      reserveCids: reserveCids.length, disclosed: disclosed.length,
+      updateId: result.transaction?.updateId || result.updateId,
+    });
+  } catch (e) {
+    console.error('ACCEPT MIGRATION error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -1746,7 +2621,7 @@ app.get('/admin/migration-snapshot/:party', async (req, res) => {
  *  accounting/DAR bug. Tolerance absorbs sub-dust Decimal rounding. */
 app.get('/admin/solvency', async (req, res) => {
   try {
-    const P = `#alpend-lending-final-loop:Lending.`;
+    const P = `#alpend-lending:Lending.`;
     const [reserveC, depositC, borrowC, holdingC] = await Promise.all([
       queryContracts(`${P}AssetReserve:AssetReserve`, READ_PARTY),
       queryContracts(`${P}Deposit:DepositPosition`, READ_PARTY),
@@ -1840,20 +2715,17 @@ app.post('/admin/create-verifier', async (req, res) => {
         CreateCommand: {
           templateId: `#verifier:Verifier:Verifier`,
           createArguments: {
-            owner: POOL_OPERATOR,
-            observers: [],
+            owner: DECPARTY_OPERATOR || POOL_OPERATOR,
+            // Load-bearing: the pusher exercises Verify on this contract, so it must be able to
+            // see it. observers:[] gives CONTRACT_NOT_FOUND at push time.
+            observers: [process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR],
           },
         },
       },
     ];
-    const result = await submitCommand(commands, [POOL_OPERATOR]);
-    const verifierCid = extractContractId(result);
-    console.log(`Created Verifier: ${verifierCid} (owner=${POOL_OPERATOR})`);
-    res.json({
-      success: true,
-      verifierCid,
-      next: 'POST /admin/set-verifier { verifierCid, verifierConfigCid } — pair this with the Chainlink VerifierConfig CID (from oracle-verifier-contracts).',
-    });
+    return await operatorAction(res, commands, `#verifier:Verifier:Verifier`,
+      { step: 'Verifier (ours)',
+        next: 'POST /admin/create-feeder { verifierCid, verifierConfigCid, expectedConfigOwner } — pair ours with Chainlink\'s VerifierConfig.' });
   } catch (e) {
     console.error('CREATE VERIFIER error:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -1866,9 +2738,12 @@ app.post('/admin/create-verifier', async (req, res) => {
  *  config side is empty, that observer grant is missing (or the template name differs). */
 app.get('/admin/oracle-verifier-contracts', async (req, res) => {
   try {
+    // Chainlink's VerifierConfig is only visible to the party they granted observer access to,
+    // so allow querying as an explicit party — the grant may not be on our current pusher.
+    const asParty = req.query.party || POOL_OPERATOR;
     const [verifiers, configs] = await Promise.all([
-      queryContracts(`#verifier:Verifier:Verifier`, POOL_OPERATOR).catch((e) => ({ __err: e.message })),
-      queryContracts(`#verifier-config:VerifierConfig:VerifierConfig`, POOL_OPERATOR).catch((e) => ({ __err: e.message })),
+      queryContracts(`#verifier:Verifier:Verifier`, asParty).catch((e) => ({ __err: e.message })),
+      queryContracts(`#verifier-config:VerifierConfig:VerifierConfig`, asParty).catch((e) => ({ __err: e.message })),
     ]);
     // Surface which config digests each VerifierConfig actually holds. `Verifier.Verify` looks the
     // report's configDigest up in `verifierConfigStateView.verifierStates`; a digest missing here is
@@ -1883,6 +2758,10 @@ app.get('/admin/oracle-verifier-contracts', async (req, res) => {
             : Object.entries(raw).map(([digest, state]) => ({ digest, state }));
           return {
             contractId: c.contractId,
+            // ChainlinkPriceFeeder.validateVerifierPair asserts
+            // cfg.confirmedOwnerView.owner == expectedConfigOwner — this is that value,
+            // i.e. exactly what to pass as expectedConfigOwner at feeder creation.
+            confirmedOwner: c.createArgument?.confirmedOwnerView?.owner ?? null,
             digestCount: entries.length,
             digests: entries.map((e) => ({
               configDigest: e.digest,
@@ -1895,7 +2774,15 @@ app.get('/admin/oracle-verifier-contracts', async (req, res) => {
     res.json({
       success: true,
       hint: 'verifiers = our own instance(s) from create-verifier. verifierConfigs = Chainlink-issued (needs their observer grant). `digests` = config digests the config covers; a report whose configDigest is absent fails UpdatePrice with DigestNotSet.',
-      verifiers: Array.isArray(verifiers) ? verifiers.map((c) => ({ contractId: c.contractId })) : verifiers,
+      // observers matter: the oraclePusher MUST be able to see the Verifier it exercises
+      // Verify on, or the push fails CONTRACT_NOT_FOUND.
+      verifiers: Array.isArray(verifiers)
+        ? verifiers.map((c) => ({
+            contractId: c.contractId,
+            owner: c.createArgument?.owner ?? null,
+            observers: c.createArgument?.observers ?? [],
+          }))
+        : verifiers,
       verifierConfigs: configDetail,
     });
   } catch (e) {
@@ -1910,7 +2797,7 @@ app.get('/admin/oracle-verifier-contracts', async (req, res) => {
  *  HF<1 on-chain at liquidation time; this only surfaces candidates. */
 app.get('/admin/liquidatable', async (req, res) => {
   try {
-    const P = `#alpend-lending-final-loop:Lending.`;
+    const P = `#alpend-lending:Lending.`;
     const [poolC, reserveC, userPosC, depositC, borrowC, oracleC] = await Promise.all([
       queryContracts(`${P}Pool:LendingPool`, READ_PARTY),
       queryContracts(`${P}AssetReserve:AssetReserve`, READ_PARTY),
@@ -2032,7 +2919,7 @@ app.get('/admin/liquidatable', async (req, res) => {
 /** GET /query/lending-pool — query LendingPool contracts */
 app.get('/query/lending-pool', async (req, res) => {
   try {
-    const templateId = `#alpend-lending-final-loop:Lending.Pool:LendingPool`;
+    const templateId = `#alpend-lending:Lending.Pool:LendingPool`;
     const contracts = targetFilter(await queryContracts(templateId, READ_PARTY));
     res.json({ success: true, contracts });
   } catch (e) {
@@ -2044,7 +2931,7 @@ app.get('/query/lending-pool', async (req, res) => {
 /** GET /query/user-position/:party — query UserPosition (via pool operator who is observer) */
 app.get('/query/user-position/:party', async (req, res) => {
   try {
-    const templateId = `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`;
+    const templateId = `#alpend-lending:Lending.UserPosition:UserPosition`;
     // Query as the deployment's poolOperator (observer on UserPosition), then filter by party
     const contracts = await queryContracts(templateId, READ_PARTY);
     // Return ONLY this party's UserPosition(s). NEVER fall back to all contracts when the
@@ -2062,7 +2949,7 @@ app.get('/query/user-position/:party', async (req, res) => {
 /** GET /query/deposit-position — query all DepositPositions (via pool operator who is observer) */
 app.get('/query/deposit-position/:party?', async (req, res) => {
   try {
-    const templateId = `#alpend-lending-final-loop:Lending.Deposit:DepositPosition`;
+    const templateId = `#alpend-lending:Lending.Deposit:DepositPosition`;
     const contracts = await queryContracts(templateId, READ_PARTY);
     const party = req.params.party;
     const filtered = party ? contracts.filter(c => c.createArgument?.depositor === party) : contracts;
@@ -2076,7 +2963,7 @@ app.get('/query/deposit-position/:party?', async (req, res) => {
 /** GET /query/borrow-position — query BorrowPositions (via pool operator who is observer) */
 app.get('/query/borrow-position/:party?', async (req, res) => {
   try {
-    const templateId = `#alpend-lending-final-loop:Lending.Borrow:BorrowPosition`;
+    const templateId = `#alpend-lending:Lending.Borrow:BorrowPosition`;
     const contracts = await queryContracts(templateId, READ_PARTY);
     const party = req.params.party;
     const filtered = party ? contracts.filter(c => c.createArgument?.borrower === party) : contracts;
@@ -2099,10 +2986,10 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
 
     // Fetch all pool-level contracts in parallel
     const [poolContracts, assetReserveContracts, userPosContracts, oracleContracts] = await Promise.all([
-      queryContracts(`#alpend-lending-final-loop:Lending.Pool:LendingPool`, READ_PARTY),
-      queryContracts(`#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`, READ_PARTY),
-      queryContracts(`#alpend-lending-final-loop:Lending.UserPosition:UserPosition`, READ_PARTY),
-      queryContracts(`#alpend-lending-final-loop:Lending.Oracle:PriceOracle`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.Pool:LendingPool`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.AssetReserve:AssetReserve`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.UserPosition:UserPosition`, READ_PARTY),
+      queryContracts(`#alpend-lending:Lending.Oracle:PriceOracle`, READ_PARTY),
     ]);
 
     const disclosed = [];
@@ -2111,7 +2998,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
     for (const reserve of assetReserveContracts) {
       if (reserve?.contractId && reserve?.createdEventBlob) {
         disclosed.push({
-          templateId: reserve.templateId || `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`,
+          templateId: reserve.templateId || `#alpend-lending:Lending.AssetReserve:AssetReserve`,
           contractId: reserve.contractId,
           createdEventBlob: reserve.createdEventBlob,
           domainId: synchronizerId,
@@ -2123,7 +3010,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
     const latestOracle = oracleContracts[oracleContracts.length - 1];
     if (latestOracle?.contractId && latestOracle?.createdEventBlob) {
       disclosed.push({
-        templateId: latestOracle.templateId || `#alpend-lending-final-loop:Lending.Oracle:PriceOracle`,
+        templateId: latestOracle.templateId || `#alpend-lending:Lending.Oracle:PriceOracle`,
         contractId: latestOracle.contractId,
         createdEventBlob: latestOracle.createdEventBlob,
         domainId: synchronizerId,
@@ -2138,7 +3025,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
       const latestUserPos = userPos[userPos.length - 1];
       if (latestUserPos?.contractId && latestUserPos?.createdEventBlob) {
         disclosed.push({
-          templateId: latestUserPos.templateId || `#alpend-lending-final-loop:Lending.UserPosition:UserPosition`,
+          templateId: latestUserPos.templateId || `#alpend-lending:Lending.UserPosition:UserPosition`,
           contractId: latestUserPos.contractId,
           createdEventBlob: latestUserPos.createdEventBlob,
           domainId: synchronizerId,
@@ -2150,7 +3037,7 @@ app.get('/admin/pool-disclosed-contracts', async (req, res) => {
     const latestPool = poolContracts[poolContracts.length - 1];
     if (latestPool?.contractId && latestPool?.createdEventBlob) {
       disclosed.push({
-        templateId: latestPool.templateId || `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+        templateId: latestPool.templateId || `#alpend-lending:Lending.Pool:LendingPool`,
         contractId: latestPool.contractId,
         createdEventBlob: latestPool.createdEventBlob,
         domainId: synchronizerId,
@@ -2187,7 +3074,7 @@ app.post('/user/initialize-position', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'InitializeUserPosition',
           choiceArgument: { user },
@@ -3013,7 +3900,20 @@ app.get('/admin/usdcx-transfer-factory', async (req, res) => {
 });
 
 /** POST /admin/create-usdcx-pool — create a LendingPool configured for USDCx */
+// DEAD ENDPOINT. Its createArguments (instrumentAdmin / depositInterestRate / borrowInterestRate /
+// collateralRatio / observers) belong to a LendingPool shape that no longer exists — the current
+// template takes poolOperator/oraclePusher/treasuryParty/maintenanceOperator/oracleCid/
+// assetReserveCids + four pause flags, and per-asset rates live on AssetReserve. Kept only so an
+// old caller gets a clear message instead of an opaque Daml field error. Use:
+//   POST /admin/create-pool           (LendingPool)
+//   POST /admin/add-asset-reserve     (per-asset reserve + its rate curve)
 app.post('/admin/create-usdcx-pool', async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: 'create-usdcx-pool is obsolete — its fields do not exist on the current LendingPool. '
+         + 'Use POST /admin/create-pool, then POST /admin/add-asset-reserve for USDCx.',
+  });
+  /* eslint-disable no-unreachable */
   try {
     const {
       depositInterestRate = '0.0500000000',
@@ -3029,7 +3929,7 @@ app.post('/admin/create-usdcx-pool', async (req, res) => {
     const commands = [
       {
         CreateCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending:Lending.Pool:LendingPool`,
           createArguments: {
             poolOperator: POOL_OPERATOR,
             instrumentAdmin: USDCX_INSTRUMENT_ADMIN,
@@ -3083,7 +3983,7 @@ app.post('/admin/record-external-deposit', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.Pool:LendingPool`,
+          templateId: `#alpend-lending:Lending.Pool:LendingPool`,
           contractId: poolCid,
           choice: 'RecordExternalDeposit',
           choiceArgument: {
@@ -3170,7 +4070,7 @@ app.post('/admin/seed-cc-liquidity', async (req, res) => {
     const commands = [
       {
         ExerciseCommand: {
-          templateId: `#alpend-lending-final-loop:Lending.AssetReserve:AssetReserve`,
+          templateId: `#alpend-lending:Lending.AssetReserve:AssetReserve`,
           contractId: assetReserveCid,
           choice: 'RecordDeposit',
           choiceArgument: {
@@ -3322,10 +4222,35 @@ app.get('/admin/usdcx-config', (_, res) => {
 
 /** GET /health */
 app.get('/health', (_, res) => {
+  const ceremonyReady = !!(DECPARTY_OPERATOR && SIGNER_FPS.length && LEDGER_USER_ID && process.env.SYNCHRONIZER_ID);
   res.json({
     status: 'ok',
-    poolOperator: POOL_OPERATOR,
     lendingPackageId: LENDING_PACKAGE_ID,
+    parties: {
+      submittingAs: POOL_OPERATOR,          // the single key this server signs with
+      poolOperator: DECPARTY_OPERATOR || POOL_OPERATOR,  // signatory of pool/oracle/reserves
+      oraclePusher: process.env.ORACLE_PUSHER_PARTY || POOL_OPERATOR,
+      maintenanceOperator: process.env.MAINTENANCE_OPERATOR_PARTY || null,
+      readAs: READ_PARTY,
+    },
+    ceremony: {
+      required: !!DECPARTY_OPERATOR,        // true when poolOperator is an external multisig
+      ready: ceremonyReady,
+      signaturesRequired: SIGNER_FPS.length,
+      signers: SIGNER_FPS,
+      pending: ceremonies.size,
+      missing: [
+        !DECPARTY_OPERATOR && 'DECPARTY_OPERATOR/TARGET_POOL_OPERATOR',
+        !SIGNER_FPS.length && 'SIGNER1_FP (at least one signer fingerprint)',
+        !LEDGER_USER_ID && 'LEDGER_USER_ID/CLIENT_ID',
+        !process.env.SYNCHRONIZER_ID && 'SYNCHRONIZER_ID',
+      ].filter(Boolean),
+    },
+    oracle: {
+      // With allowManualPrice=false the ONLY price path is the feeder, so these must be set.
+      chainlinkConfigOwner: process.env.CHAINLINK_CONFIG_OWNER || null,
+      configOwnerPinned: !!process.env.CHAINLINK_CONFIG_OWNER,
+    },
   });
 });
 
